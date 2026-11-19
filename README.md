@@ -39,7 +39,7 @@ python3 -m http.server 8000
 ```
 
 ```sh
-pip install pygame PyOpenGL websockets pynacl
+pip install pygame-ce PyOpenGL websockets pynacl
 python3 client.py
 ```
 
