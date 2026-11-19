@@ -1,6 +1,6 @@
 # cyberX87 // Self-Hosted VRML97 Metaverse
 
-A self-hostable VRML97 metaverse featuring a Python/WebSocket backend (`server.py`), a standalone Python/OpenGL desktop client (`client.py`), and a single-file HTML/X\_ITE web client (`index.html`).
+A self-hostable VRML97 metaverse featuring a Python/WebSocket backend (`server.py`), a standalone Python/OpenGL desktop client (`client.py`).
 
 ## Features
 
@@ -47,14 +47,6 @@ To connect directly to a remote server on launch:
 
 ```sh
 python3 client.py ws://friend-server.example.org:
-```
-
-### 3\. Web Client (`index.html` / `index_fixed.html`)
-
-Serve the HTML client over local HTTP and open `http://localhost:8000` in your browser:
-
-```sh
-python3 -m http.server 8000
 ```
 
 ## Desktop Client Controls & Slash Commands
