@@ -1,148 +1,204 @@
-﻿cyberX87
-A lightweight, self-hosted VRML97 / VRML 1.0 multiplayer metaverse server and desktop OpenGL client built in Python with a 1990s retrofuturistic VRML browser HUD.
-Features
-* 1990s VRML Browser & Retro Terminal HUD: Chiseled 3D beveled frames, deep-blue-to-magenta title bars, live FPS and node counters, vrml:// URL bar, status flags, XYZ compass widget, object inspector card, IRC-style terminal with cursor release, and toggleable CRT scanlines (/crt).
-* Command-Based Navigation & Cryptographic Identity: Travel via slash commands (/worlds, /world, /tp, /hop, /back). Ed25519 signing keys (~/.cyberx87_key.hex), usernames, chat colors, and avatars persist across servers without centralized accounts or passwords.
-* Cyberpunk Command Hub: Default central hub featuring ultraviolet/cyan skyboxes, a command dais, neon-cyan obelisk spire with magenta halo ring, flanking pylons, and perimeter megastructure towers.
-* In-World Object Manipulation & Custom Spawns: Raycast inspection (I), surface-snapped primitive placement (/place), moving/rotating/repainting/scaling/cloning/deleting objects, custom spawn point setting (/setspawn), and full edit undo (/undo).
-* Display List Rendering & Auto-Recovering Radio: Compiles geometry into OpenGL display lists (SceneDisplayListCache), performs async SSRF DNS checks, and automatically restores dropped internet radio streams.
-* Template-Based World Creation (/createworld): Instantly generate customized VRML97 scenes using 8 built-in templates: flat (Neon Grid), cybercity (Cyberpunk Megacity), forest (Emerald Pine Forest), desert (Solar Dunes & Pyramids), crystal (Arctic Cavern), fortress (Obsidian Citadel), island (Tropical Atoll), and space (Orbital Station Deck).
-* Comprehensive World Info (/info [world]): Inspect titles, descriptions, tags, spawn points, visibility settings, owner/co-builder identity, radio streams, object counts, and active players in one view.
-* SHA-256 World Caching & Offline Mode: Automatically caches visited scenes in ~/.cyberx87_cache/ with SHA-256 integrity verification. Explore cached worlds or local .wrl files offline via --offline, /offline, or /openwrl.
-* Access Control & Collaborative Building: Toggle private visibility (/privateworld), manage allowed visitor lists, and grant co-builder edit permissions (/allowbuilder). Private worlds are hidden from public listings and friend teleports.
-* True 3D VRML Avatars & Nametags: Upload and equip custom VRML avatars with strict header/syntax validation, triangulated polygon rendering, automatic grounding/scaling, and floating 3D nametags.
-* Cross-Server Federation: Link peer nodes (data/federation.json), query live node directories (/peers), bookmark servers, and seamlessly hop across metaverse nodes.
-* Universal VRML Parser & Renderer: Full parsing support for VRML 2.0/97 (primitives, IndexedFaceSet, ElevationGrid, Extrusion, nested transforms, DEF/USE, environment nodes) and legacy VRML 1.0.
-* AABB Collision, Grounding & Flight Toggle: Real-time physics for floors, stairs, and terrain with gravity, jumping, wall sliding, and toggleable free-flight mode (/fly).
-* Server Quotas & Permissions: Configurable limits on total worlds and user world quotas, managed via administrative permissions.
-* Creator Metadata & Internet Radio Controls: Creators manage world titles, descriptions, tags, and radio streams, integrated directly into VRML WorldInfo and AudioClip nodes.
-* Backup, Snapshots & Export: Create server-side snapshots (/backup), restore previous world builds (/restore), and export clean .wrl files locally (/export).
-* Mutual Friend System: Manage friend requests, view online presence, send private whispers (/msg), and teleport to online friends (/goto).
-* Plugin System (.x87): Extend client functionality and server spawners using plain-text macro scripts with live hot-reloading (/reload).
-* Security Hardening: Replay protection nonces, rate limiting, script node stripping, async SSRF IP filtering, path traversal protection, and atomic file persistence.
-Installation
-pip install pygame PyOpenGL websockets pynacl
-
-(Optional for /radio internet stream playback: install ffplay via ffmpeg, mpv, or vlc.)
-Running
-1. Start the server (first user to connect is automatically granted admin privileges):
+# cyberX87
 
+**cyberX87** is a self-hosted, standalone desktop **VRML 1.0 / VRML97 (`.wrl`)** multiplayer metaverse client and server written in Python. Built with an authentic 1990s retrofuturistic aesthetic, local-first cryptography, SHA-256 disk caching, and human-readable `.x87` command plugins, it lets you host, explore, rate, and collaboratively build 3D worlds without cloud lock-in.
 
-python3 server.py
-
-2. Start the desktop client (online):
+---
 
+## Key Features
 
-python3 client.py ws://localhost:8765
-
-3. Start the desktop client directly in offline exploration mode:
-4. Launch standalone world editor tools:
+* **Standalone 3D VRML Browser (`client.py`):** Renders VRML 1.0 and VRML97 scenes (`Box`/`Cube`, `Cylinder`, `Cone`, `Sphere`, `IndexedFaceSet`, `IndexedLineSet`, `ElevationGrid`, `Extrusion`, `DEF`/`USE`, `Viewpoint`, `Background`, `Fog`, and `AudioClip`) using Pygame and PyOpenGL.
+* **Ed25519 Cryptographic Identity:** Generates a local Ed25519 keypair (`~/.cyberx87_key.hex`) and authenticates via challenge-nonce signatures—no passwords or central accounts required. The first user to connect to a fresh server is automatically granted `admin` rights.
+* **In-World Building & World Templates:** Create worlds from 8 built-in templates (`flat`, `cybercity`, `forest`, `desert`, `crystal`, `fortress`, `island`, `space`), place primitives (`box`, `pillar`, `sphere`, `cone`, `arch`, `platform`, `wall`) with surface-normal snapping, and move, rotate, paint, scale, clone, or undo changes live.
+* **Client-Side Pre-Upload `.wrl` Validation:** Validates `.wrl` worlds and custom 3D avatars locally (`/validate` and automatically on `/upload`) for UTF-8 headers, comment/quote-aware brace & bracket balance, geometry bounds, and size limits (`5 MB` worlds / `512 KB` avatars) before transmitting.
+* **World Rating & Discovery System:** Rate worlds `1–5` stars with optional reviews (`/rate`), view rating distributions and feedback (`/ratings`), browse top-rated worlds (`/topworlds`), and inspect world ownership, spawn points, and player counts (`/info`).
+* **Offline Mode & SHA-256 Disk Cache:** Automatically caches visited worlds and custom avatars locally (`~/.cyberx87_cache/`) with SHA-256 hash verification, allowing full offline exploration (`/offline`, `/openwrl`).
+* **Multi-Node Server Federation:** Bookmark servers (`/bookmark`) and hop seamlessly between self-hosted cyberX87 nodes (`/hop`, `/back`) while carrying your nickname, color, and custom 3D avatar across servers.
+* **Human-Readable `.x87` Plugins:** Extend both client (`./plugins/*.x87`) and server (`./data/plugins/*.x87`) with plain-text command macros.
+* **90s Retro Extras:** Optional CRT scanline overlay (`/crt`), external audio-player streaming radio per world (`ffplay`, `mpv`, or `cvlc` via `/radio` & `/mute`), rotating session chat logs (`./logs/`), and instant PNG screenshots (`[F2]`/`[F12]`).
 
+---
 
-python3 world_editor.py
-python3 map_editor.py
-
+## Requirements
 
+* **Python:** 3.10+
+* **Python Packages:**
+  * `pygame`
+  * `PyOpenGL`
+  * `websockets`
+  * `PyNaCl`
+* **Optional Audio Backends (for `/radio` streams):** `ffplay` (FFmpeg), `mpv`, or `cvlc` (VLC) on your system `PATH`.
 
-python3 client.py --offline [world_name]
-Controls & Commands
-Key / Command
-	Action
-	W A S D / Arrow Keys
-	Walk (or fly when /fly is active)
-	Space / Left Shift
-	Jump (walking) or Ascend / Descend (flying)
-	Mouse / ESC
-	Look around / toggle mouse cursor lock
-	I
-	Toggle interactive crosshair object inspection & AABB wireframe highlight
-	T / Enter / /
-	Open chat & command bar
-	1 – 4
-	Trigger avatar emotes (wave, dance, spin, jump)
-	/worlds, /world <name>, /templates, /createworld <name> [template] [desc]
-	List accessible worlds, jump directly to a world, view templates, or create new worlds
-	/hop <name|url> [world], /back
-	Jump to a bookmarked or remote server (and optional world) and return with /back
-	/servers, /bookmark [url] [name], /unbookmark <name>
-	View or manage saved server bookmarks and recent nodes
-	/peers
-	Inspect this node's federation directory and live peer node counts
-	/linkserver <url> [label] [world], /unlinkserver <url|label>
-	Admin: link/unlink federated peer servers in data/federation.json
-	/nodename <title>
-	Admin: set this server's public federation node name
-	/setspawn, /clearspawn, /spawn
-	Set/clear the world's spawn point & facing direction where you stand, or return to spawn
-	/place <box|pillar|sphere|cone|arch|platform|wall> [color] [scale]
-	Place a surface-snapped 3D object at the crosshair target (or 4.5m ahead)
-	/moveobj [tag_id] <dx> <dy> <dz>
-	Move a placed object by (dx, dy, dz) (aim in [I] mode to omit tag_id)
-	/rotateobj [tag_id] <degrees>
-	Rotate a placed object's yaw angle in degrees
-	/paint [tag_id] <color|#hex>
-	Repaint a placed object using a named color or #rrggbb hex
-	/scaleobj [tag_id] <multiplier>
-	Scale a placed object by a multiplier (0.2–5.0)
-	/cloneobj [tag_id] [dx dy dz]
-	Duplicate a placed object (defaults to +1.5m on X if offset omitted)
-	/delobj [tag_id]
-	Remove a specific placed object by tag ID or while aiming at it in [I] mode
-	/undo
-	Undo the most recent edit or spawn change via automatic snapshot
-	/crt
-	Toggle 1990s CRT horizontal scanline overlay
-	
+---
 
-	
+## Quick Start
 
-	/cache, /clearcache
-	List locally cached worlds (with SHA-256 hashes) or clear ~/.cyberx87_cache/
-	/offline [world], /online
-	Switch to offline exploration mode or reconnect online
-	/openwrl <path/to/scene.wrl>
-	Load any local .wrl file directly into the 3D client offline
-	/acl, /privateworld <on|off>
-	View world ACLs or toggle private invite-only mode
-	/allowbuilder <user>, /removebuilder <user>
-	Grant or revoke co-builder edit permissions on your world
-	/allowvisitor <user>, /revokevisitor <user>
-	Whitelist or remove allowed visitors on a private world
-	/avatars, /avatar <name|default>
-	List uploaded 3D avatars or equip a custom avatar
-	
+### 1. Clone & Install Dependencies
 
-	
+```bash
+git clone https://github.com/<your-username>/cyberX87.git
+cd cyberX87
+python -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+pip install pygame PyOpenGL websockets pynacl
+```
 
-	/fly [on|off]
-	Toggle free-flight mode vs. grounded gravity & AABB collision
-	/tp [x y z]
-	Teleport to coordinates or jump near scene objects
-	/backup [world] [label], /backups [world]
-	Create or list server-side snapshots for a world you own/co-build
-	/restore <snapshot.wrl> [world]
-	Restore a saved snapshot back into your live world
-	/export [world] [output_path.wrl]
-	Export your world's .wrl and .meta.json to ./exports/
-	/upload <world|avatar> <name> <file.wrl> [desc], /info [world]
-	Upload custom 3D content or display detailed information about a world
-	
+### 2. Start the Server
 
-	
+```bash
+python server.py
+```
 
-	/desc [world] <text>, /worldtitle <title>, /worldtags <t1,t2>
-	Edit metadata for a world you created
-	/radio <http_url> [name], /radio off, /mute
-	Set your world's internet radio stream or toggle local mute
-	/friends, /addfriend <user>, /accept <user>, /unfriend <user>
-	Manage your mutual friends list
-	/msg <friend> <text>, /goto <friend>
-	Whisper an online friend or teleport to their location
-	/plugins, /reload
-	List or reload client .x87 plugins
-	/maxworlds <n>, /userworldlimit <n>
-	Admin: cap total server worlds or worlds per user (0 = unlimited)
-	/perms, /admin, /grant, /ban, /delworld <name>
-	Server admin role and world moderation commands
-	/nick <name>, /color <#hex>, /key, /quit
-	Customize identity, view Ed25519 public key, or exit client
+By default, the server listens on `ws://0.0.0.0:8765` and initializes `./data/` (`worlds/`, `avatars/`, `backups/`, `plugins/`, `permissions.json`, `world_meta.json`, `friends.json`, and `federation.json`).
+
+### 3. Launch the Client
+
+Connect to your local server:
+
+```bash
+python client.py
+```
+
+Connect to a remote server:
+
+```bash
+python client.py ws://example.com:8765
+```
+
+Launch directly into offline cache mode:
+
+```bash
+python client.py --offline [world_name]
+```
+
+---
+
+## Controls
+
+| Key / Input | Action |
+| :--- | :--- |
+| `W` `A` `S` `D` / Arrow Keys | Move forward, strafe, and backpedal |
+| `Mouse Move` | Look around (when mouse is captured) |
+| `Space` | Jump (or ascend in `/fly` mode) |
+| `Left Shift` | Descend in `/fly` mode |
+| `Esc` | Toggle mouse capture / release cursor |
+| `T` / `Enter` / `/` | Open chat / command prompt |
+| `V` | Cycle camera mode (`1st-Person`, `3rd-Person Chase`, `3rd-Person Front`) |
+| `Q` / `E` & `Mouse Wheel` | Orbit and zoom camera (in 3rd-person / front modes) |
+| `R` | Reset camera orbit and zoom |
+| `I` | Toggle crosshair raycast object inspector & surface placement |
+| `1` `2` `3` `4` | Trigger emotes (`wave`, `dance`, `spin`, `jump`) |
+| `F2` / `F12` | Save a PNG screenshot to `./screenshots/` |
+| `H` | Toggle HUD visibility |
+
+---
+
+## Command Reference
+
+### Navigation & Camera
+* `/worlds` — List accessible worlds on the server (or cached worlds offline)
+* `/world <name>` — Join a world
+* `/spawn` — Teleport to the world's spawn point
+* `/tp [x y z]` — Teleport to coordinates (or near the first scene object)
+* `/fly [on|off]` — Toggle noclip flight mode
+* `/cam [1st|3rd|front]` — Switch camera perspective
+* `/camdist <1.5..15.0>` — Set third-person camera distance
+* `/hud` — Hide or show the HUD
+* `/crt` — Toggle 90s CRT scanlines
+* `/screenshot [name]` — Capture a screenshot to `./screenshots/`
+
+### World Creation, Building & Validation
+* `/templates` — List available procedural VRML97 world templates
+* `/createworld <name> [template] [description]` — Generate and upload a new world from a template
+* `/validate <file.wrl> [world|avatar]` — Run pre-upload `.wrl` syntax, geometry, and bounds checks locally
+* `/upload <world|avatar> <name> <file.wrl> [description]` — Upload a `.wrl` world or 3D avatar
+* `/place <box|pillar|sphere|cone|arch|platform|wall> [color] [scale]` — Place an object in front of you (or snapped to the aimed surface when `[I]` scan mode is active)
+* `/moveobj [id] <dx> <dy> <dz>` — Translate a placed object (aim with `[I]` or pass its ID)
+* `/rotateobj [id] <degrees>` — Rotate a placed object around the Y axis
+* `/paint [id] <color|#hex>` — Change a placed object's diffuse/emissive color
+* `/scaleobj [id] <multiplier>` — Scale a placed object
+* `/cloneobj [id] [dx dy dz]` — Duplicate a placed object
+* `/delobj [id]` — Delete a placed object
+* `/undo` — Revert the last world edit from automatic snapshots
+* `/setspawn` / `/clearspawn` — Set or reset the world's custom `Viewpoint` spawn
+
+### World Metadata, Ratings & Backups
+* `/info [world]` — View world owner, co-builders, ratings, spawn point, file size, and active players
+* `/rate <1..5> [comment]` or `/rate <world> <1..5> [comment]` — Rate a world (1–5 stars) with an optional review
+* `/unrate [world]` — Remove your rating from a world
+* `/ratings [world]` — View rating breakdown and recent player reviews
+* `/topworlds` — Show the highest-rated accessible worlds
+* `/desc [world] <description>` — Update a world's description
+* `/worldtitle <title>` / `/worldtags <t1, t2, ...>` — Update world title or tags
+* `/radio <http_stream_url> [Station Name]` / `/radio off` — Set or clear the world's streaming radio station
+* `/mute` — Mute or unmute world radio playback
+* `/backup [world] [label]` / `/backups [world]` / `/restore <file.wrl> [world]` — Create, list, and restore world snapshots
+* `/export [world] [path]` — Export a world `.wrl` and `.meta.json` to `./exports/`
+
+### Access Control, Social & Federation
+* `/acl [world]` — View world privacy, co-builders, and visitor whitelist
+* `/privateworld <on|off>` — Toggle private access on your world
+* `/allowbuilder <user>` / `/removebuilder <user>` — Manage world co-builders
+* `/allowvisitor <user>` / `/revokevisitor <user>` — Manage private world whitelist
+* `/nick <name>` / `/color <#rrggbb>` — Update your display name or beacon color
+* `/avatar <name|default>` / `/avatars` — Equip or list custom 3D `.wrl` avatars
+* `/key` — Display your Ed25519 public key and 8-character short ID
+* `/friends` / `/addfriend <user>` / `/accept <user>` / `/unfriend <user>` — Manage mutual friends
+* `/msg <friend> <message>` / `/goto <friend>` — Whisper or teleport to an online friend
+* `/servers` / `/bookmark [url] [name]` / `/unbookmark <name>` — Manage server bookmarks
+* `/hop <bookmark|ws://host:port> [world]` / `/back` — Jump between cyberX87 servers
+* `/peers` / `/linkserver <url> [label]` / `/unlinkserver <url|label>` / `/nodename <name>` — Manage server federation
+
+### Offline Cache, Chat Logs & Plugins
+* `/cache` / `/clearcache` — Inspect or clear `~/.cyberx87_cache/`
+* `/offline [world]` / `/online` — Switch between local cache mode and live server mode
+* `/openwrl <file.wrl>` — Preview a local `.wrl` file offline
+* `/logs` / `/logtail [n]` / `/clearlogs` — Inspect or prune session chat logs in `./logs/`
+* `/plugins` / `/reload` — List or reload `.x87` command plugins
+
+---
+
+## Writing `.x87` Command Plugins
+
+Place `.x87` files in `./plugins/` (client) or `./data/plugins/` (server), separating multiple commands with `---`:
+
+```ini
+# ./plugins/custom.x87
+COMMAND: /greet
+DESC: Wave and greet everyone in the current world
+ACTION: multi
+STEPS:
+  emote wave
+  chat Hello from {nick} in #{world}!
+```
+
+---
+
+## Recommended `.gitignore`
+
+If you are pushing this repository to GitHub, add a `.gitignore` so local runtime state, world data, logs, and screenshots are not committed:
+
+```gitignore
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+data/
+logs/
+screenshots/
+exports/
+```
+
+---
+
+## Project Structure
+
+```text
+cyberX87/
+├── client.py        # Standalone Pygame + PyOpenGL VRML97 browser & WebSocket client
+├── server.py        # Async WebSocket metaverse server, world store, ACLs & ratings
+├── plugins/         # Client-side .x87 command plugins
+├── data/            # Server runtime state (worlds, avatars, backups, metadata)
+├── exports/         # Exported .wrl scenes and metadata
+├── logs/            # Rotating session chat logs
+└── screenshots/     # Captured PNG screenshots
+```
