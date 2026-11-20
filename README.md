@@ -173,23 +173,6 @@ STEPS:
 
 ---
 
-## Recommended `.gitignore`
-
-If you are pushing this repository to GitHub, add a `.gitignore` so local runtime state, world data, logs, and screenshots are not committed:
-
-```gitignore
-__pycache__/
-*.py[cod]
-.venv/
-venv/
-data/
-logs/
-screenshots/
-exports/
-```
-
----
-
 ## Project Structure
 
 ```text
