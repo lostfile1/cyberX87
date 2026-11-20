@@ -455,8 +455,15 @@ def _safe_ints(text: str) -> list[int]:
     return [int(m) for m in re.findall(r"[-+]?\d+", text)]
 
 
+def _safe_log_mtime(fp: Path) -> float:
+    try:
+        return fp.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 class ChatLogger:
-    """Thread-safe file logger that records only in-world chat messages, whispers, and emotes."""
+    """Thread-safe rotating file logger that records only in-world chat messages, whispers, and emotes."""
 
     def __init__(self, log_dir: Path = LOGS_DIR):
         self.log_dir = log_dir
@@ -464,41 +471,55 @@ class ChatLogger:
         self.enabled = True
         self.line_count = 0
         self.bytes_written = 0
+        self._part = 1
+        self._session_stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
         self.log_path: Path | None = None
         self._fh = None
-        self._init_file()
+        self._open_new_log_file()
 
-    def _init_file(self):
+    def _prune_old_logs(self):
+        existing = sorted(self.log_dir.glob("chat_*.log"), key=_safe_log_mtime, reverse=True)
+        for old_fp in existing[MAX_CLIENT_LOGS - 1 :]:
+            try:
+                old_fp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _open_new_log_file(self):
+        if self._fh is not None:
+            try:
+                self._fh.flush()
+                self._fh.close()
+            except Exception:
+                pass
+            self._fh = None
         try:
             self.log_dir.mkdir(parents=True, exist_ok=True)
             try:
                 os.chmod(self.log_dir, 0o700)
             except OSError:
                 pass
-            existing = sorted(self.log_dir.glob("chat_*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
-            for old_fp in existing[MAX_CLIENT_LOGS - 1 :]:
-                try:
-                    old_fp.unlink(missing_ok=True)
-                except OSError:
-                    pass
-            ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-            candidate = self.log_dir / f"chat_{ts}_{os.getpid()}.log"
+            self._prune_old_logs()
+            suffix = f"_p{self._part}" if self._part > 1 else ""
+            candidate = self.log_dir / f"chat_{self._session_stamp}_{os.getpid()}{suffix}.log"
             self._fh = open(candidate, "a", encoding="utf-8", buffering=1)
             try:
                 os.chmod(candidate, 0o600)
             except OSError:
                 pass
+            self.bytes_written = 0
+            self._part += 1
             self.log_path = candidate.resolve()
         except Exception:
             self._fh = None
             self.log_path = None
 
     def log_chat(self, world: str, sender: str, text: str, is_pm: bool = False, is_emote: bool = False):
-        if not self.enabled or self._fh is None:
+        if not self.enabled:
             return
         ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         clean_w = _clean_ident(world, 32, "hub")
-        clean_sender = re.sub(r"[\x00-\x1f\x7f]", " ", str(sender or "?")).strip()[:40]
+        clean_sender = re.sub(r"[\x00-\x1f\x7f]", " ", str(sender or "?")).strip()[:40] or "?"
         clean_text = re.sub(r"[\x00-\x1f\x7f]", " ", str(text or "")).strip()
         if not clean_text:
             return
@@ -509,9 +530,15 @@ class ChatLogger:
         else:
             line = f"[{ts_str}] [#{clean_w}] <{clean_sender}> {clean_text}\n"
         encoded_len = len(line.encode("utf-8", errors="replace"))
+        if encoded_len > MAX_LOG_FILE_BYTES:
+            return
         with self._lock:
-            if self._fh is None or self.bytes_written + encoded_len > MAX_LOG_FILE_BYTES:
+            if self._fh is None:
                 return
+            if self.bytes_written + encoded_len > MAX_LOG_FILE_BYTES:
+                self._open_new_log_file()
+                if self._fh is None:
+                    return
             try:
                 self._fh.write(line)
                 self._fh.flush()
@@ -690,8 +717,32 @@ def parse_vrml(wrl_text: str):
     if not wrl_text or not wrl_text.strip():
         return scene
 
-    is_vrml1 = "#VRML V1.0" in wrl_text[:64]
-    clean = re.sub(r"#.*", "", wrl_text).replace(",", " ")
+    wrl_no_bom = wrl_text.lstrip("\ufeff")
+    is_vrml1 = "#VRML V1.0" in wrl_no_bom[:64]
+    # Strip # comments outside double-quoted strings so # inside WorldInfo/URLs never swallows tokens
+    _c_chars = []
+    _in_q = False
+    _idx = 0
+    _nlen = len(wrl_no_bom)
+    while _idx < _nlen:
+        _ch = wrl_no_bom[_idx]
+        if _ch == "\\" and _in_q and _idx + 1 < _nlen:
+            _c_chars.append(_ch)
+            _c_chars.append(wrl_no_bom[_idx + 1])
+            _idx += 2
+            continue
+        if _ch == '"':
+            _in_q = not _in_q
+            _c_chars.append(_ch)
+            _idx += 1
+            continue
+        if _ch == "#" and not _in_q:
+            while _idx < _nlen and wrl_no_bom[_idx] != "\n":
+                _idx += 1
+            continue
+        _c_chars.append(_ch)
+        _idx += 1
+    clean = "".join(_c_chars).replace(",", " ")
     non_empty_lines = [ln.strip() for ln in clean.splitlines() if ln.strip()]
     scene["raw_preview"] = " | ".join(non_empty_lines[:5])[:160]
 
@@ -1034,6 +1085,15 @@ def get_object_aabb(obj: dict) -> tuple[float, float, float, float, float, float
             min(px + p[0] * sx for p in obj["pts"]), max(px + p[0] * sx for p in obj["pts"]),
             min(py + p[1] * sy for p in obj["pts"]), max(py + p[1] * sy for p in obj["pts"]),
             min(pz + p[2] * sz for p in obj["pts"]), max(pz + p[2] * sz for p in obj["pts"]),
+        )
+    if kind == "grid" and obj.get("heights"):
+        xd, zd = max(1, int(obj.get("xd", 1))), max(1, int(obj.get("zd", 1)))
+        xs, zs = float(obj.get("xs", 1.0)), float(obj.get("zs", 1.0))
+        hs = obj["heights"]
+        return (
+            px, px + max(0, xd - 1) * xs * sx,
+            py + min(hs) * sy, py + max(hs) * sy,
+            pz, pz + max(0, zd - 1) * zs * sz,
         )
     if kind == "extrusion" and obj.get("spine"):
         cross = obj.get("cross") or [(-0.5, -0.5), (0.5, 0.5)]
@@ -1673,6 +1733,7 @@ class MetaverseClient:
         self.chat_log = [
             ("SYSTEM", "#00ffcc", "cyberX87 VRML97 Browser v2.03 Ready."),
         ]
+        self._net_lock = threading.Lock()
         self.out_queue = asyncio.Queue()
         self.loop = None
         self.active_ws = None
@@ -1701,14 +1762,19 @@ class MetaverseClient:
                 pass
 
     def send_json(self, payload: dict):
-        if self.loop and not self.loop.is_closed() and self.connected and self.short_id:
+        with self._net_lock:
+            loop = self.loop
+            is_conn = self.connected
+            sid = self.short_id
+            is_off = self.offline_mode
+        if loop and not loop.is_closed() and is_conn and sid:
             try:
-                self.loop.call_soon_threadsafe(self.out_queue.put_nowait, json.dumps(payload))
+                loop.call_soon_threadsafe(self.out_queue.put_nowait, json.dumps(payload))
             except RuntimeError:
                 self.log("NET-ERR", "#ff4444", "Connection loop closing.")
-        elif self.connected and not self.short_id:
+        elif is_conn and not sid:
             self.log("NET", "#ffaa00", "Authenticating with server, try again in a moment.")
-        elif self.offline_mode:
+        elif is_off:
             self.log("OFFLINE", "#ffaa00", "Offline mode - type /online to reconnect.")
         else:
             self.log("NET-ERR", "#ff4444", "Not connected to server.")
@@ -2031,7 +2097,10 @@ class MetaverseClient:
                                 wls = data.get("whitelist", [])
                                 players = data.get("players", [])
                                 sp_pos = data.get("spawn_pos", [0.0, 2.25, 13.5])
-                                self.log("WORLD-INFO", "#00ff66", f"=== {data.get('title', w)} ({w}) [{'PRIVATE' if data.get('private') else 'PUBLIC'}] - {max(1, int(data.get('bytes', 0)) // 1024)} KB, {int(data.get('snapshots_count', 0))} backups ===")
+                                cnt_r = int(data.get("rating_count", 0) or 0)
+                                avg_r = float(data.get("avg_rating", 0.0) or 0.0)
+                                rat_badge = f" | Rating: {avg_r:.1f}/5 ({cnt_r} vote{'s' if cnt_r != 1 else ''})" if cnt_r > 0 else " | Rating: unrated"
+                                self.log("WORLD-INFO", "#00ff66", f"=== {data.get('title', w)} ({w}) [{'PRIVATE' if data.get('private') else 'PUBLIC'}]{rat_badge} - {max(1, int(data.get('bytes', 0)) // 1024)} KB, {int(data.get('snapshots_count', 0))} backups ===")
                                 self.log("ABOUT", "#00ffcc", f"Description: {data.get('description') or '(none set)'}" + (f" | Tags: {', '.join(data.get('tags', []))}" if data.get("tags") else ""))
                                 self.log("SPAWN", "#00ffcc", f"Spawn Point [{'CUSTOM' if data.get('spawn_custom') else 'DEFAULT'}]: ({sp_pos[0]:.2f}, {sp_pos[1]:.2f}, {sp_pos[2]:.2f}) yaw={float(data.get('spawn_yaw', 0.0) or 0.0):.0f} deg")
                                 if data.get("is_system") and not owner:
@@ -2084,13 +2153,41 @@ class MetaverseClient:
                             elif mtype == "worlds_list":
                                 self.worlds = data.get("worlds", ["hub"])
                                 descs = data.get("descriptions", {})
+                                ratings_map = data.get("ratings", {})
                                 self.world_descriptions.update(descs)
                                 cur = data.get("current", self.world)
                                 self.log("WORLDS", "#00ff66", f"Available ({len(self.worlds)}) - jump with /world <name>:")
                                 for w in self.worlds:
                                     c_tag = " [cached]" if get_cached_world(self.server_url, w) else ""
+                                    rmeta = ratings_map.get(w)
+                                    r_tag = f" [{rmeta['avg']:.1f}/5 ({rmeta['count']})]" if rmeta else ""
                                     w_d = descs.get(w, "")
-                                    self.log("WORLD", "#00ffcc", f"  {'*' if w == cur else '-'} {w}{c_tag}{f': {w_d}' if w_d else ''}")
+                                    self.log("WORLD", "#00ffcc", f"  {'*' if w == cur else '-'} {w}{r_tag}{c_tag}{f': {w_d}' if w_d else ''}")
+
+                            elif mtype == "world_ratings_info":
+                                w = data.get("world", self.world)
+                                cnt_r = int(data.get("count", 0) or 0)
+                                avg_r = float(data.get("avg", 0.0) or 0.0)
+                                dist = data.get("dist", {})
+                                if cnt_r == 0:
+                                    self.log("RATINGS", "#ffaa00", f"World '{w}' has no ratings yet. Rate it with /rate <1-5> [comment]")
+                                else:
+                                    dist_str = " ".join(f"{s}*:{int(dist.get(str(s), 0))}" for s in (5, 4, 3, 2, 1))
+                                    self.log("RATINGS", "#00ff66", f"=== Ratings for '{w}': {avg_r:.2f}/5 ({cnt_r} vote{'s' if cnt_r != 1 else ''}) [{dist_str}] ===")
+                                    for rev in data.get("reviews", []):
+                                        you_tag = " [YOU]" if rev.get("is_me") else ""
+                                        note = f' - "{rev["review"]}"' if rev.get("review") else ""
+                                        self.log("REVIEW", "#00ffcc", f"  [{rev.get('stars', 0)}/5] {rev.get('nick', '?')} ({rev.get('short_id', '')}){you_tag}{note}")
+
+                            elif mtype == "world_ratings_top":
+                                ranked = data.get("worlds", [])
+                                if not ranked:
+                                    self.log("TOP-WORLDS", "#ffaa00", "No rated worlds yet. Visit a world and run /rate <1-5> [comment]!")
+                                else:
+                                    self.log("TOP-WORLDS", "#00ff66", f"Top Rated Worlds ({len(ranked)}):")
+                                    for idx_r, item in enumerate(ranked, 1):
+                                        d_txt = f" - {item['description']}" if item.get("description") else ""
+                                        self.log("RANK", "#00ffcc", f"  #{idx_r} {item['world']} ({item['avg']:.2f}/5, {item['count']} vote{'s' if item['count'] != 1 else ''}){d_txt}")
 
                             elif mtype == "avatars_list":
                                 self.avatars = data.get("avatars", [])
@@ -2137,8 +2234,9 @@ class MetaverseClient:
                                     self.log("REQUESTS", "#ff66cc", f"Pending ({len(plist)}): " + ", ".join(f"{p['nick']} ({p['short_id']})" for p in plist) + " - type /accept <id>")
 
                             elif mtype == "whisper":
-                                pm_label = f"PM from {data.get('from_nick')}" if data.get("incoming") else f"PM to {data.get('to_nick')}"
-                                pm_text = data.get("text", "")
+                                peer_nick = str(data.get("from_nick") if data.get("incoming") else data.get("to_nick") or "?").strip() or "?"
+                                pm_label = f"PM from {peer_nick}" if data.get("incoming") else f"PM to {peer_nick}"
+                                pm_text = str(data.get("text", ""))
                                 self.log(pm_label, "#ff66ff" if data.get("incoming") else "#cc88ff", pm_text)
                                 self.chat_logger.log_chat(self.world, pm_label, pm_text, is_pm=True)
 
@@ -2187,13 +2285,14 @@ class MetaverseClient:
                                 self.chat_logger.log_chat(self.world, c_nick, c_text)
 
                             elif mtype == "emote":
-                                sid, em = data.get("short_id"), data.get("emote", "wave")
-                                if sid in self.peers:
+                                sid, em = data.get("short_id"), str(data.get("emote", "wave")).strip()
+                                if sid in self.peers and em:
                                     self.peers[sid]["emote"] = em
                                     self.peers[sid]["emote_until"] = time.time() + 2.5
-                                em_nick = data.get("nick", "?")
-                                self.log("*", "#ff66cc", f"{em_nick} performs /{em}")
-                                self.chat_logger.log_chat(self.world, em_nick, em, is_emote=True)
+                                em_nick = str(data.get("nick", "?")).strip() or "?"
+                                if em:
+                                    self.log("*", "#ff66cc", f"{em_nick} performs /{em}")
+                                    self.chat_logger.log_chat(self.world, em_nick, em, is_emote=True)
 
                             elif mtype == "upload_ok":
                                 kind_up, name_up = data.get("kind"), data.get("name", "")
@@ -2426,6 +2525,93 @@ def _extract_placed_id_and_nums(sub_tokens: list[str], looked_at_hit, expected_n
     return target_id, nums
 
 
+MAX_PREUPLOAD_WORLD_BYTES = 5 * 1024 * 1024
+MAX_PREUPLOAD_AVATAR_BYTES = 512 * 1024
+
+
+def _mask_non_code_tokens(text: str) -> str:
+    """Strips # comments and quoted strings so brace/bracket checks inspect VRML structure accurately."""
+    out = []
+    in_quote = False
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and in_quote and i + 1 < n:
+            i += 2
+            continue
+        if ch == '"':
+            in_quote = not in_quote
+            out.append('"')
+            i += 1
+            continue
+        if ch == "#" and not in_quote:
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if not in_quote:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def validate_preupload_wrl(kind: str, wrl_content: str, parsed_scene: dict) -> tuple[bool, str, list[str]]:
+    """Validates a .wrl world or avatar before upload and returns (ok, error_msg, warnings)."""
+    warnings: list[str] = []
+    if not wrl_content or not wrl_content.strip():
+        return False, "Pre-upload check failed: empty VRML file.", warnings
+    if "\x00" in wrl_content:
+        return False, "Pre-upload check failed: binary NUL bytes detected; upload a plain UTF-8/ASCII .wrl file.", warnings
+
+    clean_bom = wrl_content.lstrip("\ufeff")
+    first_line = next((ln.strip() for ln in clean_bom.splitlines() if ln.strip()), "")
+    if not re.match(r"^#VRML\s+V(1\.0|2\.0)\s+(ascii|utf8)\b", first_line):
+        return False, "Pre-upload check failed: file must start with '#VRML V2.0 utf8' or '#VRML V1.0 ascii'.", warnings
+
+    encoded_len = len(clean_bom.encode("utf-8", errors="replace"))
+    max_bytes = MAX_PREUPLOAD_AVATAR_BYTES if kind == "avatar" else MAX_PREUPLOAD_WORLD_BYTES
+    limit_label = "512 KB" if kind == "avatar" else "5 MB"
+    if encoded_len > max_bytes:
+        return False, f"Pre-upload check failed: {kind} file is {encoded_len // 1024} KB (exceeds {limit_label} server limit).", warnings
+
+    struct_view = _mask_non_code_tokens(clean_bom).strip()
+    if struct_view.startswith(("{", "[", "<")) or re.search(r"<\s*(?:!DOCTYPE|html|xml|X3D|COLLADA)\b", struct_view, re.I):
+        return False, "Pre-upload check failed: JSON/XML/HTML/X3D markup detected; only VRML (.wrl) files are accepted.", warnings
+    if struct_view.count("{") == 0 or struct_view.count("{") != struct_view.count("}"):
+        return False, "Pre-upload check failed: unbalanced '{' and '}' braces in .wrl file.", warnings
+    if struct_view.count("[") != struct_view.count("]"):
+        return False, "Pre-upload check failed: unbalanced '[' and ']' brackets in .wrl file.", warnings
+
+    geom_tokens = r"\b(Shape|Box|Sphere|Cylinder|Cone|IndexedFaceSet|IndexedLineSet|ElevationGrid|Extrusion|Separator|Cube)\b"
+    if not re.search(geom_tokens, struct_view):
+        return False, "Pre-upload check failed: no VRML 1.0 / VRML97 geometry nodes found in .wrl file.", warnings
+
+    objs = parsed_scene.get("objects", []) if isinstance(parsed_scene, dict) else []
+    has_proto = bool(re.search(r"\b(?:PROTO|EXTERNPROTO)\b", struct_view))
+    if not objs and not has_proto:
+        return False, "Pre-upload check failed: no renderable 3D geometry objects parsed from .wrl file.", warnings
+    if not objs and has_proto:
+        warnings.append("PROTO-based scene detected; standalone client does not expand custom PROTO geometry.")
+
+    if re.search(r"\b(?:DEF\s+[A-Za-z0-9_-]+\s+)?Script\s*\{", struct_view) or re.search(r"javascript\s*:", clean_bom, re.I):
+        warnings.append("Script nodes detected; server will strip executable Script blocks on upload.")
+    if re.search(r"\b(?:DEF\s+[A-Za-z0-9_-]+\s+)?Anchor\s*\{", struct_view):
+        warnings.append("Anchor nodes detected; server will strip Anchor blocks on upload.")
+
+    aabbs = [b for b in (get_object_aabb(o) for o in objs) if b is not None]
+    span_txt = ""
+    if aabbs:
+        sx_span = max(b[1] for b in aabbs) - min(b[0] for b in aabbs)
+        sy_span = max(b[3] for b in aabbs) - min(b[2] for b in aabbs)
+        sz_span = max(b[5] for b in aabbs) - min(b[4] for b in aabbs)
+        span_txt = f", bounds {sx_span:.1f}x{sy_span:.1f}x{sz_span:.1f}m"
+        if kind == "avatar" and max(sx_span, sy_span, sz_span) > 40.0:
+            warnings.append("Avatar geometry spans >40m; verify scale before uploading.")
+
+    warnings.insert(0, f"{len(objs)} object(s), {max(1, encoded_len // 1024)} KB{span_txt} - ready to upload.")
+    return True, "", warnings
+
+
 def handle_command(client: MetaverseClient, text: str):
     cleaned = " ".join(text.strip().split())
     parts = cleaned.split(" ", 2)
@@ -2435,7 +2621,7 @@ def handle_command(client: MetaverseClient, text: str):
         client.log("COMMANDS", "#ff66cc", "Jump: /worlds | /world <name> | /tp [x y z] | /spawn | /peers | /hop <node> [world] | /back")
         client.log("COMMANDS", "#ff66cc", "Camera & Shot: [V]=Cycle Cam | /cam <1st|3rd|front> | /camdist <m> | [F2/F12]=Screenshot | /screenshot [name] | [H]=HUD")
         client.log("COMMANDS", "#ff66cc", "Build: /place <shape> [color] [scale] | /moveobj <dx dy dz> | /rotateobj <deg> | /paint <color> | /undo")
-        client.log("COMMANDS", "#ff66cc", "Worlds: /templates | /createworld <name> [template] [desc] | /upload | /info | /inspect | [I]=Scan")
+        client.log("COMMANDS", "#ff66cc", "Worlds & Ratings: /templates | /createworld <name> [tpl] | /rate <1-5> [note] | /ratings | /topworlds | /validate <file.wrl> | /info")
     elif cmd in ("/cam", "/camera"):
         mode_arg = parts[1].strip().lower() if len(parts) > 1 and parts[1].strip() else ""
         order = ("first", "third", "front")
@@ -2472,7 +2658,7 @@ def handle_command(client: MetaverseClient, text: str):
         if not cl or not cl.log_path:
             client.log("CHAT-LOG", "#ffaa00", "Chat logging is unavailable (could not open ./logs/).")
         else:
-            all_logs = sorted(LOGS_DIR.glob("chat_*.log"), key=lambda p: p.stat().st_mtime, reverse=True) if LOGS_DIR.exists() else []
+            all_logs = sorted(LOGS_DIR.glob("chat_*.log"), key=_safe_log_mtime, reverse=True) if LOGS_DIR.exists() else []
             kb = max(1, cl.bytes_written // 1024)
             client.log("CHAT-LOG", "#00ff66", f"Active chat log: {cl.log_path} ({cl.line_count} messages, {kb} KB) | {len(all_logs)} file(s) in ./logs/")
             client.log("CHAT-LOG", "#00ffcc", "Use /logtail [n] to view recent chat messages or /clearlogs to prune old chat logs.")
@@ -2989,15 +3175,14 @@ def handle_command(client: MetaverseClient, text: str):
         if b"\x00" in raw_bytes:
             client.log("ERR", "#ff4444", "Binary files are not allowed; upload a text VRML (.wrl) file.")
             return
-        wrl_content = raw_bytes.decode("utf-8", errors="replace")
-        first_line = wrl_content.splitlines()[0].strip() if wrl_content.splitlines() else ""
-        if not re.match(r"^#VRML\s+V(1\.0|2\.0)\s+(ascii|utf8)\b", first_line):
-            client.log("ERR", "#ff4444", "Invalid VRML header: file must start with '#VRML V2.0 utf8' or '#VRML V1.0 ascii'.")
-            return
+        wrl_content = raw_bytes.decode("utf-8", errors="replace").lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
         parsed_check = parse_vrml(wrl_content)
-        if not parsed_check.get("objects"):
-            client.log("ERR", "#ff4444", "Upload blocked: no valid VRML 3D geometry found in file.")
+        ok_pre, pre_err, pre_notes = validate_preupload_wrl(kind, wrl_content, parsed_check)
+        if not ok_pre:
+            client.log("ERR", "#ff4444", pre_err)
             return
+        for idx_n, note_txt in enumerate(pre_notes):
+            client.log("PRECHECK", "#00ff66" if idx_n == 0 else "#ffaa00", note_txt)
         if kind == "avatar":
             store_cached_avatar_wrl(name, wrl_content)
         payload = {"type": "upload", "kind": kind, "name": name, "filename": p.name, "content": wrl_content}
@@ -3008,6 +3193,74 @@ def handle_command(client: MetaverseClient, text: str):
         client.log("TEMPLATES", "#00ff66", "Available World Templates (use /createworld <name> <template> [description]):")
         for tkey, tmeta in WORLD_TEMPLATES.items():
             client.log("TEMPLATE", "#00ffcc", f"  {tkey:<10} - {tmeta['label']}: {tmeta['desc']}")
+    elif cmd == "/validate":
+        sub = cleaned.split(" ", 2)
+        if len(sub) < 2 or not sub[1].strip():
+            client.log("ERR", "#ff4444", "Usage: /validate <path/to/file.wrl> [world|avatar]")
+            return
+        raw_arg = cleaned.split(" ", 1)[1].strip()
+        v_kind = "world"
+        if raw_arg.lower().endswith(" avatar"):
+            v_kind = "avatar"
+            raw_arg = raw_arg[:-7].strip()
+        elif raw_arg.lower().endswith(" world"):
+            v_kind = "world"
+            raw_arg = raw_arg[:-6].strip()
+        p = Path(raw_arg.strip('"').strip("'")).expanduser()
+        if p.suffix.lower() != ".wrl":
+            client.log("ERR", "#ff4444", "Only VRML (.wrl) files can be validated.")
+            return
+        if not p.is_file():
+            client.log("ERR", "#ff4444", f"File not found: {p}")
+            return
+        raw_bytes = p.read_bytes()
+        if b"\x00" in raw_bytes:
+            client.log("ERR", "#ff4444", "Binary NUL bytes detected; invalid text VRML (.wrl) file.")
+            return
+        wrl_content = raw_bytes.decode("utf-8", errors="replace").lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+        parsed_check = parse_vrml(wrl_content)
+        ok_pre, pre_err, pre_notes = validate_preupload_wrl(v_kind, wrl_content, parsed_check)
+        if not ok_pre:
+            client.log("ERR", "#ff4444", pre_err)
+            return
+        for idx_n, note_txt in enumerate(pre_notes):
+            client.log("VALIDATE", "#00ff66" if idx_n == 0 else "#ffaa00", f"[{p.name} as {v_kind}] {note_txt}")
+    elif cmd == "/rate":
+        sub = cleaned.split(" ", 3)
+        if len(sub) < 2 or not sub[1].strip():
+            client.log("ERR", "#ff4444", "Usage: /rate <1..5> [optional comment] OR /rate <world_name> <1..5> [optional comment]")
+            return
+        tok1 = sub[1].strip()
+        tok2 = sub[2].strip() if len(sub) >= 3 else ""
+        is_int = lambda s: bool(s) and (s.isdigit() or (s.startswith("-") and s[1:].isdigit()))
+
+        if is_int(tok1) and 1 <= int(tok1) <= 5:
+            target_w = client.world
+            stars_val = int(tok1)
+            review_str = " ".join(cleaned.split(" ", 2)[2].split())[:140] if len(sub) >= 3 else ""
+        elif is_int(tok2):
+            target_w = tok1
+            stars_val = int(tok2)
+            review_str = " ".join(sub[3].split())[:140] if len(sub) >= 4 else ""
+        elif is_int(tok1):
+            client.log("ERR", "#ff4444", "Rating must be between 1 and 5 stars.")
+            return
+        else:
+            client.log("ERR", "#ff4444", "Usage: /rate <1..5> [comment] OR /rate <world_name> <1..5> [comment]")
+            return
+
+        if stars_val < 1 or stars_val > 5:
+            client.log("ERR", "#ff4444", "Rating must be between 1 and 5 stars.")
+            return
+        client.send_json({"type": "rate_world", "action": "rate", "world": target_w, "stars": stars_val, "review": review_str})
+    elif cmd == "/unrate":
+        target_w = parts[1].strip() if len(parts) > 1 and parts[1].strip() else client.world
+        client.send_json({"type": "rate_world", "action": "unrate", "world": target_w})
+    elif cmd == "/ratings":
+        target_w = parts[1].strip() if len(parts) > 1 and parts[1].strip() else client.world
+        client.send_json({"type": "rate_world", "action": "list", "world": target_w})
+    elif cmd == "/topworlds":
+        client.send_json({"type": "rate_world", "action": "top"})
     elif cmd == "/createworld":
         sub = cleaned.split(" ", 3)
         if len(sub) < 2 or not sub[1].strip():

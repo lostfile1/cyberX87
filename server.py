@@ -45,6 +45,7 @@ RATE_LIMITS = {
     "friend_action": (10, 10.0),
     "set_world_meta": (10, 10.0),
     "get_world_info": (15, 10.0),
+    "rate_world": (10, 15.0),
     "join_world": (15, 10.0),
     "federation": (6, 15.0),
     "get_avatar": (15, 10.0),
@@ -601,9 +602,84 @@ def read_wrl_safe(path: Path) -> str:
 def has_vrml_geometry(content: str) -> bool:
     return any(tok in content for tok in (
         "Shape", "Box", "Sphere", "Cylinder", "Cone",
-        "IndexedFaceSet", "ElevationGrid", "Extrusion",
+        "IndexedFaceSet", "IndexedLineSet", "ElevationGrid", "Extrusion",
         "Separator", "Cube",
     ))
+
+
+def _strip_vrml_anchor_nodes(text: str) -> str:
+    """Removes Anchor nodes using brace depth tracking so nested blocks never leave stray braces."""
+    out = []
+    i = 0
+    n = len(text)
+    in_quote = False
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and in_quote and i + 1 < n:
+            out.append(ch)
+            out.append(text[i + 1])
+            i += 2
+            continue
+        if ch == '"':
+            in_quote = not in_quote
+            out.append(ch)
+            i += 1
+            continue
+        if not in_quote and (text[i : i + 6] == "Anchor" or text[i : i + 3] == "DEF"):
+            m = re.match(r"(?:DEF\s+[A-Za-z0-9_-]+\s+)?Anchor\s*\{", text[i:])
+            if m and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] in ("_", "-"))):
+                brace_pos = i + m.end() - 1
+                depth = 0
+                j = brace_pos
+                q_inner = False
+                while j < n:
+                    c2 = text[j]
+                    if c2 == "\\" and q_inner and j + 1 < n:
+                        j += 2
+                        continue
+                    if c2 == '"':
+                        q_inner = not q_inner
+                    elif not q_inner:
+                        if c2 == "{":
+                            depth += 1
+                        elif c2 == "}":
+                            depth -= 1
+                            if depth == 0:
+                                i = j + 1
+                                break
+                    j += 1
+                else:
+                    i = n
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _mask_vrml_non_code(text: str) -> str:
+    """Strips # comments outside quotes and blanks out string literal contents so structural brace/bracket checks match client precheck."""
+    out = []
+    in_quote = False
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and in_quote and i + 1 < n:
+            i += 2
+            continue
+        if ch == '"':
+            in_quote = not in_quote
+            out.append('"')
+            i += 1
+            continue
+        if ch == "#" and not in_quote:
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if not in_quote:
+            out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def validate_strict_vrml_document(content: str, kind: str = "world") -> tuple[bool, str]:
@@ -613,12 +689,12 @@ def validate_strict_vrml_document(content: str, kind: str = "world") -> tuple[bo
     if "\x00" in content:
         return False, "Upload rejected: binary files are not allowed; only UTF-8/ASCII VRML (.wrl) files are accepted."
 
-    lines = content.splitlines()
-    first_line = lines[0].strip() if lines else ""
+    clean_bom = content.lstrip("\ufeff")
+    first_line = next((ln.strip() for ln in clean_bom.splitlines() if ln.strip()), "")
     if not re.match(r"^#VRML\s+V(1\.0|2\.0)\s+(ascii|utf8)\b", first_line):
         return False, "Upload rejected: file must start with '#VRML V2.0 utf8' or '#VRML V1.0 ascii'."
 
-    stripped_body = re.sub(r"#.*", "", content).strip()
+    stripped_body = _mask_vrml_non_code(clean_bom).strip()
     if stripped_body.startswith(("{", "[", "<")):
         return False, "Upload rejected: JSON, XML/X3D, and HTML files are not accepted; upload a VRML (.wrl) file."
     if re.search(r"<\s*(?:!DOCTYPE|html|xml|X3D|COLLADA)\b", stripped_body, re.I):
@@ -631,7 +707,7 @@ def validate_strict_vrml_document(content: str, kind: str = "world") -> tuple[bo
 
     vrml_nodes = (
         r"\b(Shape|Box|Sphere|Cylinder|Cone|IndexedFaceSet|IndexedLineSet|"
-        r"ElevationGrid|Extrusion|Transform|Group|Separator|Cube|Coordinate3|Material)\b"
+        r"ElevationGrid|Extrusion|Transform|Group|Separator|Cube|Coordinate3|Material|PROTO|EXTERNPROTO)\b"
     )
     if not re.search(vrml_nodes, stripped_body):
         return False, "Upload rejected: no valid VRML 1.0 / VRML97 nodes found."
@@ -750,8 +826,8 @@ def apply_vrml_world_info(
     info_field = f' info [{" ".join(info_items)}]' if info_items else ""
     info_block = f'WorldInfo {{ title "{safe_title}"{info_field} }}'
 
-    if re.search(r"WorldInfo\s*\{[^}]*\}", wrl_text, re.S):
-        out = re.sub(r"WorldInfo\s*\{[^}]*\}", info_block, wrl_text, count=1, flags=re.S)
+    if re.search(r"\bWorldInfo\s*\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", wrl_text, re.S):
+        out = re.sub(r"\bWorldInfo\s*\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", info_block, wrl_text, count=1, flags=re.S)
     else:
         lines = wrl_text.splitlines()
         if lines and lines[0].startswith("#VRML"):
@@ -785,7 +861,7 @@ def ensure_valid_vrml_world(world_name: str, content: str) -> str:
         text = "#VRML V2.0 utf8\n" + text
 
     text = sanitize_vrml_script_nodes(text)
-    text = re.sub(r"\b(?:DEF\s+[A-Za-z0-9_-]+\s+)?Anchor\s*\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", "", text, flags=re.S)
+    text = _strip_vrml_anchor_nodes(text)
     text = text.replace(",", " ")
     text = re.sub(
         r"\b(diffuseColor|emissiveColor|specularColor|skyColor|translation|rotation|scale|size|radius|height|bottomRadius)\s*:",
@@ -1098,6 +1174,28 @@ async def send_world_transition(websocket, client_state: dict, target: str, w_me
     }, exclude_ws=websocket)
 
 
+def summarize_world_ratings(w_entry: dict) -> tuple[float, int, dict[int, int]]:
+    ratings = w_entry.get("ratings")
+    dist = {5: 0, 4: 0, 3: 0, 2: 0, 1: 0}
+    if not isinstance(ratings, dict) or not ratings:
+        return 0.0, 0, dist
+    total = 0
+    count = 0
+    for item in ratings.values():
+        if not isinstance(item, dict):
+            continue
+        try:
+            st = int(item.get("stars", 0))
+        except (TypeError, ValueError):
+            continue
+        if 1 <= st <= 5:
+            dist[st] += 1
+            total += st
+            count += 1
+    avg = round(total / count, 2) if count > 0 else 0.0
+    return avg, count, dist
+
+
 def build_world_info_payload(target: str, meta: dict, perms: dict) -> dict:
     wrl_path = WORLDS_DIR / f"{target}.wrl"
     w_entry = meta.get(target, {})
@@ -1115,8 +1213,11 @@ def build_world_info_payload(target: str, meta: dict, perms: dict) -> dict:
         }
 
     sp_pos, sp_yaw = get_world_spawn(target, w_entry)
+    avg_rat, cnt_rat, _ = summarize_world_ratings(w_entry)
     return {
         "type": "world_info",
+        "avg_rating": avg_rat,
+        "rating_count": cnt_rat,
         "world": target,
         "title": w_entry.get("title") or ("Neo-Genesis Grid" if target.lower() == "hub" else target),
         "description": w_entry.get("description", ""),
@@ -1444,6 +1545,8 @@ async def handler(websocket):
                 if text.startswith("/"):
                     srv_plugins = load_server_plugins()
                     cmd_tok, _, cmd_args = text.partition(" ")
+                    if not cmd_tok or len(cmd_tok) > 32:
+                        continue
                     spec = srv_plugins.get(cmd_tok.lower())
                     if spec:
                         req_role = spec.get("role", "guest").lower()
@@ -1522,8 +1625,9 @@ async def handler(websocket):
                     }))
                     continue
                 old_world = client_state["world"]
-                client_state["world"] = target
-                await broadcast_world(old_world, {"type": "peer_leave", "short_id": client_state["short_id"]}, exclude_ws=websocket)
+                if old_world != target:
+                    client_state["world"] = target
+                    await broadcast_world(old_world, {"type": "peer_leave", "short_id": client_state["short_id"]}, exclude_ws=websocket)
                 await send_world_transition(websocket, client_state, target, w_meta, str(data.get("cached_hash", "")).strip().lower())
 
             elif msg_type == "list_worlds":
@@ -1536,10 +1640,16 @@ async def handler(websocket):
                     w: f"{'[PRIVATE] ' if meta.get(w, {}).get('private') else ''}{meta.get(w, {}).get('description', '')}".strip()
                     for w in worlds_list
                 }
+                ratings_map = {}
+                for w in worlds_list:
+                    avg_r, cnt_r, _ = summarize_world_ratings(meta.get(w, {}))
+                    if cnt_r > 0:
+                        ratings_map[w] = {"avg": avg_r, "count": cnt_r}
                 await websocket.send(json.dumps({
                     "type": "worlds_list",
                     "worlds": worlds_list,
                     "descriptions": descriptions,
+                    "ratings": ratings_map,
                     "current": client_state["world"],
                 }))
 
@@ -1592,6 +1702,123 @@ async def handler(websocket):
                     await websocket.send(json.dumps({"type": "error", "msg": f"Access denied: '{target}' is a private world."}))
                     continue
                 await websocket.send(json.dumps(build_world_info_payload(target, meta, load_perms())))
+
+            elif msg_type == "rate_world":
+                action = str(data.get("action", "list")).strip().lower()
+                meta = load_world_meta()
+
+                if action == "top":
+                    ranked = []
+                    for f in WORLDS_DIR.glob("*.wrl"):
+                        w_name = f.stem
+                        w_entry = meta.get(w_name, {})
+                        if not can_visit_world(w_name, w_entry, client_state["pubkey"], client_state["role"]):
+                            continue
+                        avg_r, cnt_r, _ = summarize_world_ratings(w_entry)
+                        if cnt_r > 0:
+                            ranked.append({
+                                "world": w_name,
+                                "title": w_entry.get("title") or w_name,
+                                "avg": avg_r,
+                                "count": cnt_r,
+                                "description": w_entry.get("description", ""),
+                            })
+                    ranked.sort(key=lambda item: (item["avg"], item["count"], item["world"]), reverse=True)
+                    await websocket.send(json.dumps({"type": "world_ratings_top", "worlds": ranked[:15]}))
+                    continue
+
+                target = sanitize_name(str(data.get("world") or client_state["world"]))
+                if not (WORLDS_DIR / f"{target}.wrl").exists():
+                    await websocket.send(json.dumps({"type": "error", "msg": f"World '{target}' does not exist."}))
+                    continue
+                w_entry = meta.get(target, {})
+                if not can_visit_world(target, w_entry, client_state["pubkey"], client_state["role"]):
+                    await websocket.send(json.dumps({"type": "error", "msg": f"Access denied: '{target}' is a private world."}))
+                    continue
+
+                if action == "list":
+                    avg_r, cnt_r, dist = summarize_world_ratings(w_entry)
+                    nick_reg = load_perms().get("nick_registry", {})
+                    raw_ratings = w_entry.get("ratings", {}) if isinstance(w_entry.get("ratings"), dict) else {}
+                    reviews = []
+                    for pk, r_obj in raw_ratings.items():
+                        if not isinstance(r_obj, dict):
+                            continue
+                        st_val = int(r_obj.get("stars", 0) or 0)
+                        if 1 <= st_val <= 5:
+                            reviews.append({
+                                "short_id": pk[:8],
+                                "nick": nick_reg.get(pk) or r_obj.get("nick") or pk[:8],
+                                "stars": st_val,
+                                "review": str(r_obj.get("review", "")),
+                                "updated_at": int(r_obj.get("updated_at", 0) or 0),
+                                "is_me": pk == client_state["pubkey"],
+                            })
+                    reviews.sort(key=lambda r: r["updated_at"], reverse=True)
+                    await websocket.send(json.dumps({
+                        "type": "world_ratings_info",
+                        "world": target,
+                        "avg": avg_r,
+                        "count": cnt_r,
+                        "dist": {str(k): v for k, v in dist.items()},
+                        "reviews": reviews[:10],
+                    }))
+                    continue
+
+                if action == "unrate":
+                    async with UPLOAD_LOCK:
+                        meta = load_world_meta()
+                        w_entry = meta.get(target, {})
+                        ratings = w_entry.get("ratings")
+                        if not isinstance(ratings, dict) or client_state["pubkey"] not in ratings:
+                            await websocket.send(json.dumps({"type": "error", "msg": f"You have not rated '{target}' yet."}))
+                            continue
+                        ratings.pop(client_state["pubkey"], None)
+                        meta[target] = w_entry
+                        save_world_meta(meta)
+                        avg_r, cnt_r, _ = summarize_world_ratings(w_entry)
+                    summary_txt = f" ({avg_r:.1f}/5 from {cnt_r} vote{'s' if cnt_r != 1 else ''})" if cnt_r else " (no ratings yet)"
+                    await websocket.send(json.dumps({"type": "info", "msg": f"Removed your rating for '{target}'{summary_txt}."}))
+                    continue
+
+                if action == "rate":
+                    owner_key = str(w_entry.get("owner", "")).strip()
+                    if owner_key and owner_key == client_state["pubkey"]:
+                        await websocket.send(json.dumps({"type": "error", "msg": "You cannot rate your own world."}))
+                        continue
+                    try:
+                        stars = int(data.get("stars", 0))
+                    except (TypeError, ValueError):
+                        stars = 0
+                    if stars < 1 or stars > 5:
+                        await websocket.send(json.dumps({"type": "error", "msg": "Rating must be between 1 and 5 stars."}))
+                        continue
+                    review_txt = " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", str(data.get("review", ""))).split())[:140]
+                    async with UPLOAD_LOCK:
+                        meta = load_world_meta()
+                        w_entry = meta.get(target, {})
+                        ratings = w_entry.setdefault("ratings", {})
+                        if len(ratings) >= 5000 and client_state["pubkey"] not in ratings:
+                            await websocket.send(json.dumps({"type": "error", "msg": "Rating limit reached for this world."}))
+                            continue
+                        is_update = client_state["pubkey"] in ratings
+                        ratings[client_state["pubkey"]] = {
+                            "stars": stars,
+                            "review": review_txt,
+                            "nick": client_state["nick"],
+                            "updated_at": int(time.time()),
+                        }
+                        meta[target] = w_entry
+                        save_world_meta(meta)
+                        avg_r, cnt_r, _ = summarize_world_ratings(w_entry)
+                    verb = "Updated" if is_update else "Submitted"
+                    await websocket.send(json.dumps({
+                        "type": "info",
+                        "msg": f"{verb} {stars}/5 star rating for '{target}' (now {avg_r:.1f}/5 across {cnt_r} vote{'s' if cnt_r != 1 else ''})."
+                    }))
+                    continue
+
+                await websocket.send(json.dumps({"type": "error", "msg": "Unknown rating action (expected rate, unrate, list, or top)."}))
 
             elif msg_type == "world_acl":
                 action = str(data.get("action", "list"))
@@ -1933,7 +2160,7 @@ async def handler(websocket):
                     continue
 
                 name = sanitize_name(str(data.get("name", "custom")))
-                content = str(data.get("content", ""))
+                content = str(data.get("content", "")).lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
 
                 size_limit = MAX_AVATAR_SIZE if kind == "avatar" else MAX_FILE_SIZE
                 if len(content.encode("utf-8", errors="replace")) > size_limit:
@@ -2377,8 +2604,12 @@ async def handler(websocket):
                     continue
 
                 if action == "create":
-                    snap_name = create_world_snapshot(target, label=str(data.get("label", "")).strip())
-                    await websocket.send(json.dumps({"type": "info", "msg": f"Created backup snapshot: {snap_name}"}))
+                    async with UPLOAD_LOCK:
+                        snap_name = create_world_snapshot(target, label=str(data.get("label", "")).strip())
+                    if not snap_name:
+                        await websocket.send(json.dumps({"type": "error", "msg": f"World '{target}' no longer exists."}))
+                    else:
+                        await websocket.send(json.dumps({"type": "info", "msg": f"Created backup snapshot: {snap_name}"}))
                 elif action == "list":
                     await websocket.send(json.dumps({"type": "world_backups_list", "world": target, "backups": list_world_snapshots(target)}))
                 elif action == "restore":
@@ -2403,6 +2634,8 @@ async def handler(websocket):
                                 restored_meta = dict(w_entry)
                             if owner_key:
                                 restored_meta["owner"] = owner_key
+                            if "ratings" not in restored_meta and isinstance(w_entry.get("ratings"), dict):
+                                restored_meta["ratings"] = w_entry["ratings"]
                             restored_meta["updated_at"] = int(time.time())
                             r_url = str(restored_meta.get("radio_url", "")).strip()
                             if r_url and not (await is_safe_public_stream_url_async(r_url))[0]:
@@ -2530,7 +2763,10 @@ async def handler(websocket):
             IP_CONNECTIONS.pop(remote_ip, None)
         if websocket in CLIENTS:
             st = CLIENTS.pop(websocket)
-            await broadcast_world(st["world"], {"type": "peer_leave", "short_id": st["short_id"]})
+            try:
+                await broadcast_world(st["world"], {"type": "peer_leave", "short_id": st["short_id"]})
+            except Exception:
+                pass
 
 
 async def main():
