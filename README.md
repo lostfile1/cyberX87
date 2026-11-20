@@ -171,8 +171,6 @@ STEPS:
   chat Hello from {nick} in #{world}!
 ```
 
----
-
 ## Project Structure
 
 ```text
