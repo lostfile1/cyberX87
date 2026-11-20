@@ -32,6 +32,10 @@ WORLD_CACHE_INDEX = WORLD_CACHE_DIR / "index.json"
 AVATAR_CACHE_DIR = WORLD_CACHE_DIR / "avatars"
 PLUGINS_DIR = Path("./plugins")
 EXPORTS_DIR = Path("./exports")
+SCREENSHOTS_DIR = Path("./screenshots")
+LOGS_DIR = Path("./logs")
+MAX_CLIENT_LOGS = 20
+MAX_LOG_FILE_BYTES = 5 * 1024 * 1024
 DEFAULT_SERVER = "ws://localhost:8765"
 
 WINDOW_W, WINDOW_H = 1280, 760
@@ -360,6 +364,36 @@ def resolve_safe_export_path(world_name: str, custom_path: str) -> Path:
     return candidate.resolve()
 
 
+def capture_screenshot(world_name: str, custom_name: str = "") -> Path:
+    SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+    safe_world = _clean_ident(world_name, 24, "world")
+    ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    clean_custom = _clean_ident(Path(custom_name).stem, 32, "") if custom_name else ""
+    stem = clean_custom or f"cyberx87_{safe_world}_{ts}"
+    out_path = SCREENSHOTS_DIR / f"{stem}.png"
+    counter = 1
+    while out_path.exists():
+        out_path = SCREENSHOTS_DIR / f"{stem}_{counter}.png"
+        counter += 1
+
+    vp = glGetIntegerv(GL_VIEWPORT)
+    fb_w = int(vp[2]) if len(vp) >= 4 and int(vp[2]) > 0 else WINDOW_W
+    fb_h = int(vp[3]) if len(vp) >= 4 and int(vp[3]) > 0 else WINDOW_H
+
+    glFinish()
+    prev_pack = glGetIntegerv(GL_PACK_ALIGNMENT)
+    try:
+        glPixelStorei(GL_PACK_ALIGNMENT, 1)
+        glReadBuffer(GL_BACK)
+        raw = glReadPixels(0, 0, fb_w, fb_h, GL_RGB, GL_UNSIGNED_BYTE)
+    finally:
+        glPixelStorei(GL_PACK_ALIGNMENT, int(prev_pack) if prev_pack else 4)
+
+    surf = pygame.image.fromstring(raw, (fb_w, fb_h), "RGB", True)
+    pygame.image.save(surf, str(out_path))
+    return out_path.resolve()
+
+
 def load_x87_plugins(plugin_dir: Path = PLUGINS_DIR) -> dict:
     plugin_dir.mkdir(parents=True, exist_ok=True)
     sample = plugin_dir / "starter.x87"
@@ -419,6 +453,93 @@ def _safe_floats(text: str) -> list[float]:
 
 def _safe_ints(text: str) -> list[int]:
     return [int(m) for m in re.findall(r"[-+]?\d+", text)]
+
+
+class ChatLogger:
+    """Thread-safe file logger that records only in-world chat messages, whispers, and emotes."""
+
+    def __init__(self, log_dir: Path = LOGS_DIR):
+        self.log_dir = log_dir
+        self._lock = threading.Lock()
+        self.enabled = True
+        self.line_count = 0
+        self.bytes_written = 0
+        self.log_path: Path | None = None
+        self._fh = None
+        self._init_file()
+
+    def _init_file(self):
+        try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(self.log_dir, 0o700)
+            except OSError:
+                pass
+            existing = sorted(self.log_dir.glob("chat_*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+            for old_fp in existing[MAX_CLIENT_LOGS - 1 :]:
+                try:
+                    old_fp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+            candidate = self.log_dir / f"chat_{ts}_{os.getpid()}.log"
+            self._fh = open(candidate, "a", encoding="utf-8", buffering=1)
+            try:
+                os.chmod(candidate, 0o600)
+            except OSError:
+                pass
+            self.log_path = candidate.resolve()
+        except Exception:
+            self._fh = None
+            self.log_path = None
+
+    def log_chat(self, world: str, sender: str, text: str, is_pm: bool = False, is_emote: bool = False):
+        if not self.enabled or self._fh is None:
+            return
+        ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        clean_w = _clean_ident(world, 32, "hub")
+        clean_sender = re.sub(r"[\x00-\x1f\x7f]", " ", str(sender or "?")).strip()[:40]
+        clean_text = re.sub(r"[\x00-\x1f\x7f]", " ", str(text or "")).strip()
+        if not clean_text:
+            return
+        if is_pm:
+            line = f"[{ts_str}] [{clean_sender}] {clean_text}\n"
+        elif is_emote:
+            line = f"[{ts_str}] [#{clean_w}] * {clean_sender} performs /{clean_text}\n"
+        else:
+            line = f"[{ts_str}] [#{clean_w}] <{clean_sender}> {clean_text}\n"
+        encoded_len = len(line.encode("utf-8", errors="replace"))
+        with self._lock:
+            if self._fh is None or self.bytes_written + encoded_len > MAX_LOG_FILE_BYTES:
+                return
+            try:
+                self._fh.write(line)
+                self._fh.flush()
+                self.line_count += 1
+                self.bytes_written += encoded_len
+            except Exception:
+                pass
+
+    def tail(self, count: int = 8) -> list[str]:
+        if not self.log_path or not self.log_path.is_file():
+            return []
+        n = max(1, min(25, int(count)))
+        with self._lock:
+            try:
+                lines = self.log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                return lines[-n:]
+            except Exception:
+                return []
+
+    def close(self):
+        with self._lock:
+            if self._fh is not None:
+                try:
+                    self._fh.flush()
+                    self._fh.close()
+                except Exception:
+                    pass
+                self._fh = None
 
 
 class RadioPlayer:
@@ -958,6 +1079,50 @@ def raycast_aabb(origin, direction, box, max_dist=60.0):
     return tmin, (origin[0] + direction[0] * tmin, origin[1] + direction[1] * tmin, origin[2] + direction[2] * tmin), hit_normal
 
 
+def compute_active_camera_pose(
+    cam_pos: list[float],
+    yaw: float,
+    pitch: float,
+    camera_mode: str,
+    cam_dist: float,
+    cam_orbit_yaw: float,
+    objects: list[dict],
+) -> tuple[list[float], float, float]:
+    if camera_mode == "first":
+        return list(cam_pos), yaw, pitch
+
+    base_offset_yaw = yaw + cam_orbit_yaw + (180.0 if camera_mode == "front" else 0.0)
+    view_pitch = -pitch if camera_mode == "front" else pitch
+    view_yaw = base_offset_yaw
+    yr = math.radians(base_offset_yaw)
+    pr = math.radians(view_pitch)
+    cp = math.cos(pr)
+
+    anchor = (cam_pos[0], cam_pos[1] - 0.15, cam_pos[2])
+    ray_dir = (math.sin(yr) * cp, -math.sin(pr), math.cos(yr) * cp)
+    safe_dist = cam_dist
+
+    for obj in objects:
+        if obj.get("kind") == "grid":
+            continue
+        box = get_object_aabb(obj)
+        if box is None:
+            continue
+        # Ignore thin ground slabs beneath feet unless ray hits them directly
+        if (box[1] - box[0]) >= 60 and (box[5] - box[4]) >= 60 and (box[3] - box[2]) <= 0.5:
+            continue
+        hit = raycast_aabb(anchor, ray_dir, box, max_dist=cam_dist)
+        if hit is not None and hit[0] < safe_dist:
+            safe_dist = max(0.6, hit[0] - 0.35)
+
+    view_pos = [
+        anchor[0] + ray_dir[0] * safe_dist,
+        max(0.35, anchor[1] + ray_dir[1] * safe_dist),
+        anchor[2] + ray_dir[2] * safe_dist,
+    ]
+    return view_pos, view_yaw, view_pitch
+
+
 def find_looked_at_object(cam_pos, yaw_deg, pitch_deg, objects, max_dist=60.0):
     yr, pr = math.radians(yaw_deg), math.radians(pitch_deg)
     cp = math.cos(pr)
@@ -1491,12 +1656,20 @@ class MetaverseClient:
         self.offline_mode = False
         self.inspect_mode = False
         self.crt_mode = False
+        self.camera_mode = "first"   # "first" | "third" | "front"
+        self.cam_dist = 4.5
+        self.cam_orbit_yaw = 0.0
+        self.local_emote = None
+        self.local_emote_until = 0.0
+        self.screenshot_req = None
+        self.hud_hidden = False
         self.looked_at_hit = None
         self.cam_pos_ref = [0.0, 4.05, 13.5]
         self.cam_yaw_ref = 0.0
         self.cam_pitch_ref = 0.0
         self.unstuck_req = False
         self.vel_y = 0.0
+        self.chat_logger = ChatLogger()
         self.chat_log = [
             ("SYSTEM", "#00ffcc", "cyberX87 VRML97 Browser v2.03 Ready."),
         ]
@@ -1964,7 +2137,10 @@ class MetaverseClient:
                                     self.log("REQUESTS", "#ff66cc", f"Pending ({len(plist)}): " + ", ".join(f"{p['nick']} ({p['short_id']})" for p in plist) + " - type /accept <id>")
 
                             elif mtype == "whisper":
-                                self.log(f"PM from {data.get('from_nick')}" if data.get("incoming") else f"PM to {data.get('to_nick')}", "#ff66ff" if data.get("incoming") else "#cc88ff", data.get("text", ""))
+                                pm_label = f"PM from {data.get('from_nick')}" if data.get("incoming") else f"PM to {data.get('to_nick')}"
+                                pm_text = data.get("text", "")
+                                self.log(pm_label, "#ff66ff" if data.get("incoming") else "#cc88ff", pm_text)
+                                self.chat_logger.log_chat(self.world, pm_label, pm_text, is_pm=True)
 
                             elif mtype == "teleport":
                                 if data.get("pos") and len(data["pos"]) >= 3:
@@ -2005,14 +2181,19 @@ class MetaverseClient:
                                     self.peers[sid]["rot"] = data.get("rot", [0, 1, 0, 0])
 
                             elif mtype == "chat":
-                                self.log(data.get("nick", "?"), data.get("color", "#00ffcc"), data.get("text", ""))
+                                c_nick = data.get("nick", "?")
+                                c_text = data.get("text", "")
+                                self.log(c_nick, data.get("color", "#00ffcc"), c_text)
+                                self.chat_logger.log_chat(self.world, c_nick, c_text)
 
                             elif mtype == "emote":
                                 sid, em = data.get("short_id"), data.get("emote", "wave")
                                 if sid in self.peers:
                                     self.peers[sid]["emote"] = em
                                     self.peers[sid]["emote_until"] = time.time() + 2.5
-                                self.log("*", "#ff66cc", f"{data.get('nick')} performs /{em}")
+                                em_nick = data.get("nick", "?")
+                                self.log("*", "#ff66cc", f"{em_nick} performs /{em}")
+                                self.chat_logger.log_chat(self.world, em_nick, em, is_emote=True)
 
                             elif mtype == "upload_ok":
                                 kind_up, name_up = data.get("kind"), data.get("name", "")
@@ -2168,7 +2349,7 @@ def build_template_vrml_world(template_key: str, world_name: str, custom_desc: s
     else:
         for idx in range(14):
             angle = (2.0 * math.pi * idx) / 14.0
-            radius = 11.0 + ((idx * 7 + seed) % 12)
+            radius = 13.5 + ((idx * 7 + seed) % 11)
             x = round(math.cos(angle) * radius, 2)
             z = round(math.sin(angle) * radius - 4.0, 2)
             h = round(3.2 + ((idx * 5 + seed) % 9), 2)
@@ -2252,9 +2433,71 @@ def handle_command(client: MetaverseClient, text: str):
 
     if cmd == "/help":
         client.log("COMMANDS", "#ff66cc", "Jump: /worlds | /world <name> | /tp [x y z] | /spawn | /peers | /hop <node> [world] | /back")
-        client.log("COMMANDS", "#ff66cc", "Build: /place <shape> [color] [scale] | /moveobj <dx dy dz> | /rotateobj <deg> | /paint <color>")
-        client.log("COMMANDS", "#ff66cc", "Edit: /scaleobj <mult> | /cloneobj [dx dy dz] | /delobj [id] | /undo | /setspawn | /clearspawn")
+        client.log("COMMANDS", "#ff66cc", "Camera & Shot: [V]=Cycle Cam | /cam <1st|3rd|front> | /camdist <m> | [F2/F12]=Screenshot | /screenshot [name] | [H]=HUD")
+        client.log("COMMANDS", "#ff66cc", "Build: /place <shape> [color] [scale] | /moveobj <dx dy dz> | /rotateobj <deg> | /paint <color> | /undo")
         client.log("COMMANDS", "#ff66cc", "Worlds: /templates | /createworld <name> [template] [desc] | /upload | /info | /inspect | [I]=Scan")
+    elif cmd in ("/cam", "/camera"):
+        mode_arg = parts[1].strip().lower() if len(parts) > 1 and parts[1].strip() else ""
+        order = ("first", "third", "front")
+        if not mode_arg:
+            nxt = order[(order.index(client.camera_mode) + 1) % len(order)]
+        elif mode_arg in ("1", "1st", "first", "fp"):
+            nxt = "first"
+        elif mode_arg in ("3", "3rd", "third", "tp", "chase"):
+            nxt = "third"
+        elif mode_arg in ("front", "selfie", "mirror"):
+            nxt = "front"
+        else:
+            client.log("ERR", "#ff4444", "Usage: /cam [1st|3rd|front] (or press [V] to cycle, Mouse Wheel to zoom)")
+            return
+        client.camera_mode = nxt
+        client.cam_orbit_yaw = 0.0
+        labels = {"first": "1st-Person", "third": "3rd-Person Chase", "front": "3rd-Person Front (Avatar View)"}
+        client.log("CAMERA", "#00ff66", f"Camera switched to {labels[nxt]} (dist={client.cam_dist:.1f}m).")
+    elif cmd == "/camdist":
+        if len(parts) < 2 or not _safe_floats(parts[1]):
+            client.log("CAMERA", "#00ffcc", f"Camera distance: {client.cam_dist:.1f}m (usage: /camdist <1.5..15.0>)")
+            return
+        val = _safe_floats(parts[1])[0]
+        if math.isfinite(val):
+            client.cam_dist = max(1.5, min(15.0, round(val, 2)))
+            client.log("CAMERA", "#00ff66", f"Camera distance set to {client.cam_dist:.1f}m.")
+    elif cmd in ("/screenshot", "/shot", "/snap"):
+        custom_fn = cleaned.split(" ", 1)[1].strip() if " " in cleaned else ""
+        client.screenshot_req = custom_fn
+    elif cmd == "/hud":
+        client.hud_hidden = not client.hud_hidden
+    elif cmd == "/logs":
+        cl = client.chat_logger
+        if not cl or not cl.log_path:
+            client.log("CHAT-LOG", "#ffaa00", "Chat logging is unavailable (could not open ./logs/).")
+        else:
+            all_logs = sorted(LOGS_DIR.glob("chat_*.log"), key=lambda p: p.stat().st_mtime, reverse=True) if LOGS_DIR.exists() else []
+            kb = max(1, cl.bytes_written // 1024)
+            client.log("CHAT-LOG", "#00ff66", f"Active chat log: {cl.log_path} ({cl.line_count} messages, {kb} KB) | {len(all_logs)} file(s) in ./logs/")
+            client.log("CHAT-LOG", "#00ffcc", "Use /logtail [n] to view recent chat messages or /clearlogs to prune old chat logs.")
+    elif cmd == "/logtail":
+        n_lines = int(_safe_ints(parts[1])[0]) if (len(parts) > 1 and _safe_ints(parts[1])) else 8
+        recent_lines = client.chat_logger.tail(n_lines) if client.chat_logger else []
+        if not recent_lines:
+            client.log("CHAT-LOG", "#ffaa00", "No chat messages logged in this session yet.")
+        else:
+            client.log("CHAT-TAIL", "#00ff66", f"Last {len(recent_lines)} logged chat message(s):")
+            for ln in recent_lines:
+                client.log("CHAT", "#88ccff", ln[:140])
+    elif cmd == "/clearlogs":
+        active_p = client.chat_logger.log_path if client.chat_logger else None
+        removed_cnt = 0
+        if LOGS_DIR.exists():
+            for fp in LOGS_DIR.glob("chat_*.log"):
+                if active_p and fp.resolve() == active_p:
+                    continue
+                try:
+                    fp.unlink(missing_ok=True)
+                    removed_cnt += 1
+                except OSError:
+                    pass
+        client.log("CHAT-LOG", "#00ff66", f"Removed {removed_cnt} archived chat log file(s) from ./logs/.")
     elif cmd in ("/quit", "/exit"):
         client.running = False
     elif cmd == "/crt":
@@ -2871,7 +3114,8 @@ def draw_hud(client: MetaverseClient, font, chat_mode: bool, chat_buffer: str, n
     draw_bevel_panel(6, 26, WINDOW_W - 12, 22, (0.02, 0.01, 0.06, 0.95), raised=False)
     desc_suffix = f" - {client.world_desc}" if client.world_desc else ""
     radio_suffix = f" | [{'MUTE' if client.radio.muted else 'FM'}: {client.radio.name}]" if client.radio.url else ""
-    flags = f"{' [FLY]' if client.fly_mode else ''}{' [SCAN]' if client.inspect_mode else ''}"
+    cam_badge = " [3RD]" if client.camera_mode == "third" else (" [SELFIE]" if client.camera_mode == "front" else "")
+    flags = f"{' [FLY]' if client.fly_mode else ''}{' [SCAN]' if client.inspect_mode else ''}{cam_badge}"
     loc_line = f"{vrml_loc} ({len(client.scene.get('objects', []))} objs){desc_suffix}{radio_suffix} | {client.nick}{f'#{client.short_id}' if client.short_id else ''} [{client.role}]{flags}"
     while font.size(loc_line)[0] > WINDOW_W - 26 and len(loc_line) > 12:
         loc_line = loc_line[:-4] + "..."
@@ -3031,7 +3275,10 @@ def main():
             client.cam_pitch_ref = pitch
 
             scene_objs = list(client.scene.get("objects", []))
-            client.looked_at_hit = find_looked_at_object(cam_pos, yaw, pitch, scene_objs) if client.inspect_mode else None
+            view_pos, view_yaw, view_pitch = compute_active_camera_pose(
+                cam_pos, yaw, pitch, client.camera_mode, client.cam_dist, client.cam_orbit_yaw, scene_objs
+            )
+            client.looked_at_hit = find_looked_at_object(view_pos, view_yaw, view_pitch, scene_objs) if client.inspect_mode else None
 
             for event in pygame.event.get():
                 if event.type == QUIT:
@@ -3061,6 +3308,20 @@ def main():
                             pygame.mouse.set_visible(not mouse_grabbed)
                         elif event.key == K_i:
                             client.inspect_mode = not client.inspect_mode
+                        elif event.key == K_v:
+                            order = ("first", "third", "front")
+                            client.camera_mode = order[(order.index(client.camera_mode) + 1) % len(order)]
+                            client.cam_orbit_yaw = 0.0
+                            labels = {"first": "1st-Person", "third": "3rd-Person Chase", "front": "3rd-Person Front (Avatar View)"}
+                            client.log("CAMERA", "#00ff66", f"Camera: {labels[client.camera_mode]}")
+                        elif event.key == K_r and client.camera_mode != "first":
+                            client.cam_orbit_yaw = 0.0
+                            client.cam_dist = 4.5
+                            client.log("CAMERA", "#00ffcc", "Camera orbit & zoom reset.")
+                        elif event.key == K_h:
+                            client.hud_hidden = not client.hud_hidden
+                        elif event.key in (K_F2, K_F12):
+                            client.screenshot_req = ""
                         elif event.key in (K_t, K_RETURN, K_SLASH):
                             chat_mode = True
                             chat_buffer = "/" if event.key == K_SLASH else ""
@@ -3068,7 +3329,16 @@ def main():
                             pygame.mouse.set_visible(True)
                         elif event.key in (K_1, K_2, K_3, K_4):
                             em_name = {K_1: "wave", K_2: "dance", K_3: "spin", K_4: "jump"}[event.key]
+                            client.local_emote = em_name
+                            client.local_emote_until = time.time() + 2.5
                             client.send_json({"type": "chat", "text": f"/emote {em_name}"})
+                elif event.type == MOUSEWHEEL and not chat_mode:
+                    if client.camera_mode != "first":
+                        client.cam_dist = max(1.5, min(15.0, round(client.cam_dist - event.y * 0.5, 2)))
+                elif event.type == MOUSEBUTTONDOWN and not chat_mode and event.button in (4, 5):
+                    if client.camera_mode != "first":
+                        delta_z = -0.5 if event.button == 4 else 0.5
+                        client.cam_dist = max(1.5, min(15.0, round(client.cam_dist + delta_z, 2)))
                 elif event.type == MOUSEMOTION and mouse_grabbed and not chat_mode:
                     dx, dy = event.rel
                     yaw -= dx * 0.18
@@ -3076,6 +3346,11 @@ def main():
 
             if not chat_mode:
                 keys = pygame.key.get_pressed()
+                if client.camera_mode != "first":
+                    if keys[K_q]:
+                        client.cam_orbit_yaw = (client.cam_orbit_yaw + 95.0 * dt) % 360.0
+                    if keys[K_e]:
+                        client.cam_orbit_yaw = (client.cam_orbit_yaw - 95.0 * dt) % 360.0
                 speed = (12.0 if client.fly_mode else 7.5) * dt
                 rad = math.radians(yaw)
                 fx, fz = -math.sin(rad), -math.cos(rad)
@@ -3116,23 +3391,57 @@ def main():
             glLoadIdentity()
             gluPerspective(65.0, WINDOW_W / float(WINDOW_H), 0.1, 250.0)
 
+            # Recompute active camera transform after movement/input updates
+            view_pos, view_yaw, view_pitch = compute_active_camera_pose(
+                cam_pos, yaw, pitch, client.camera_mode, client.cam_dist, client.cam_orbit_yaw, scene_objs
+            )
+
             glMatrixMode(GL_MODELVIEW)
             glLoadIdentity()
-            glRotatef(-pitch, 1, 0, 0)
-            glRotatef(-yaw, 0, 1, 0)
-            glTranslatef(-cam_pos[0], -cam_pos[1], -cam_pos[2])
+            glRotatef(-view_pitch, 1, 0, 0)
+            glRotatef(-view_yaw, 0, 1, 0)
+            glTranslatef(-view_pos[0], -view_pos[1], -view_pos[2])
             glLightfv(GL_LIGHT0, GL_POSITION, (0.4, 1.0, 0.5, 0.0))
 
             display_cache.render_static_scene(client.scene, scene_objs, quadric, client.world)
             if client.looked_at_hit is not None:
                 draw_aabb_wireframe(client.looked_at_hit[0]["_aabb"])
+
+            # Render own avatar in 3rd-person / front camera modes
+            if client.camera_mode != "first":
+                if client.avatar and client.avatar != "default":
+                    client._ensure_avatar_loaded(client.avatar)
+                self_peer = {
+                    "nick": client.nick,
+                    "color": client.color,
+                    "avatar": client.avatar,
+                    "pos": [cam_pos[0], cam_pos[1] - 1.8, cam_pos[2]],
+                    "rot": [0.0, 1.0, 0.0, math.radians(yaw)],
+                    "emote": client.local_emote,
+                    "emote_until": client.local_emote_until,
+                }
+                render_peer(self_peer, quadric, now, client.avatar_meshes)
+
             for peer in list(client.peers.values()):
                 render_peer(peer, quadric, now, client.avatar_meshes)
 
-            draw_hud(client, font, chat_mode, chat_buffer, project_peer_nametags(client.peers, client.avatar_meshes, cam_pos), now, clock.get_fps())
+            if not client.hud_hidden:
+                draw_hud(client, font, chat_mode, chat_buffer, project_peer_nametags(client.peers, client.avatar_meshes, view_pos), now, clock.get_fps())
+
+            if client.screenshot_req is not None:
+                shot_label = client.screenshot_req
+                client.screenshot_req = None
+                try:
+                    saved_shot = capture_screenshot(client.world, shot_label)
+                    client.log("SCREENSHOT", "#00ff66", f"Saved screenshot -> {saved_shot}")
+                except Exception as shot_err:
+                    client.log("ERR", "#ff4444", f"Screenshot failed: {shot_err}")
+
             pygame.display.flip()
     finally:
         client.running = False
+        if getattr(client, "chat_logger", None) is not None:
+            client.chat_logger.close()
         client.radio.stop()
         display_cache.clear()
         try:
