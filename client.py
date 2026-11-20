@@ -30,11 +30,9 @@ PROFILE_CACHE_FILE = Path.home() / ".cyberx87_profile.json"
 WORLD_CACHE_DIR = Path.home() / ".cyberx87_cache"
 WORLD_CACHE_INDEX = WORLD_CACHE_DIR / "index.json"
 AVATAR_CACHE_DIR = WORLD_CACHE_DIR / "avatars"
-LAST_AI_WRL = Path.home() / ".cyberx87_last_ai.wrl"
 PLUGINS_DIR = Path("./plugins")
 EXPORTS_DIR = Path("./exports")
 DEFAULT_SERVER = "ws://localhost:8765"
-DEFAULT_AI_URL = "http://localhost:8080/v1/chat/completions"
 
 WINDOW_W, WINDOW_H = 1280, 760
 MAX_AVATAR_CACHE = 48
@@ -341,17 +339,6 @@ def is_safe_radio_url(url: str) -> tuple[bool, str]:
                 return False, "Blocked private/loopback IP address for radio stream."
         except ValueError:
             return False, "Invalid IP address for radio stream."
-    return True, ""
-
-
-def is_safe_ai_endpoint(url: str) -> tuple[bool, str]:
-    if not url or len(url) > 300:
-        return False, "AI endpoint URL must be 1..300 characters."
-    if any(ch in url for ch in ('"', "'", "\n", "\r", "\x00", " ")):
-        return False, "AI endpoint URL contains invalid characters."
-    parsed = urllib.parse.urlsplit(url)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        return False, "AI endpoint URL must use http:// or https://."
     return True, ""
 
 
@@ -1484,9 +1471,6 @@ class MetaverseClient:
         self.server_url = DEFAULT_SERVER
         self.prev_server = None
         self.node_name = "cyberX87"
-        self.ai_url = DEFAULT_AI_URL
-        self.ai_model = ""
-        self.ai_api_key = os.environ.get("OPENAI_API_KEY", "")
         self.nick = prof["nick"]
         self.color = prof["color"]
         self.role = "OFFLINE"
@@ -2089,196 +2073,155 @@ def normalize_ws_peer_client_url(raw_url: str) -> str:
     return f"{parsed.scheme}://{parsed.hostname}:{parsed.port or (443 if parsed.scheme == 'wss' else 8765)}"
 
 
-def _build_procedural_vrml_world(prompt: str, world_name: str = "world") -> str:
-    """Synthesizes distinct, prompt-themed 3D VRML97 layouts without repeating the hub monolith/twin-gate template."""
-    p = (prompt or "").lower()
-    seed = sum((idx + 1) * ord(ch) for idx, ch in enumerate(f"{world_name}:{prompt}")) or 42
+WORLD_TEMPLATES: dict[str, dict] = {
+    "flat": {
+        "label": "Blank Neon Grid",
+        "desc": "Clean 120x120 dark cyber-grid floor ready for /place building",
+    },
+    "cybercity": {
+        "label": "Cyberpunk Megacity",
+        "desc": "Neon-trimmed skyscrapers, glowing walkways, and central plaza",
+    },
+    "forest": {
+        "label": "Emerald Pine Forest",
+        "desc": "Grassy clearing surrounded by tall pine trees and warm sky",
+    },
+    "desert": {
+        "label": "Solar Dunes & Pyramids",
+        "desc": "Golden sandstone pyramids under an amber desert horizon",
+    },
+    "crystal": {
+        "label": "Arctic Crystal Cavern",
+        "desc": "Glacial ice floor with translucent cyan & violet crystal spires",
+    },
+    "fortress": {
+        "label": "Obsidian Citadel",
+        "desc": "Walled stone keep with four corner watchtowers and courtyard",
+    },
+    "island": {
+        "label": "Tropical Atoll",
+        "desc": "Sandy palm islands rising out of a deep turquoise sea",
+    },
+    "space": {
+        "label": "Orbital Station Deck",
+        "desc": "Deep-space platform ringed by glowing reactor spheres and beacons",
+    },
+}
 
-    if any(k in p for k in ("forest", "jungle", "nature", "park", "garden", "wood", "tree")):
-        sky, ground_c, accent1, accent2, theme = "0.14 0.36 0.56, 0.35 0.62 0.78", "0.11 0.34 0.14", "0.18 0.72 0.25", "0.52 0.34 0.16", "forest"
-    elif any(k in p for k in ("desert", "mars", "canyon", "pyramid", "egypt", "sand", "dune")):
-        sky, ground_c, accent1, accent2, theme = "0.42 0.18 0.07, 0.75 0.38 0.14", "0.62 0.40 0.18", "0.92 0.64 0.24", "0.98 0.38 0.10", "pyramid"
-    elif any(k in p for k in ("ice", "snow", "arctic", "crystal", "cave", "winter", "glacier")):
-        sky, ground_c, accent1, accent2, theme = "0.06 0.18 0.38, 0.24 0.48 0.70", "0.68 0.82 0.92", "0.35 0.92 1.00", "0.70 0.50 1.00", "crystal"
-    elif any(k in p for k in ("space", "station", "moon", "alien", "void", "nebula", "star")):
-        sky, ground_c, accent1, accent2, theme = "0.01 0.01 0.05, 0.09 0.02 0.20", "0.18 0.20 0.28", "0.10 0.95 0.80", "1.00 0.52 0.05", "space"
-    elif any(k in p for k in ("castle", "fortress", "keep", "dungeon", "ruin", "temple", "arena")):
-        sky, ground_c, accent1, accent2, theme = "0.12 0.10 0.20, 0.28 0.20 0.34", "0.24 0.24 0.28", "0.85 0.68 0.22", "0.75 0.20 0.25", "fortress"
-    elif any(k in p for k in ("ocean", "sea", "island", "water", "bay", "harbor", "reef")):
-        sky, ground_c, accent1, accent2, theme = "0.05 0.28 0.52, 0.30 0.65 0.85", "0.04 0.32 0.58", "0.92 0.78 0.42", "0.15 0.85 0.75", "island"
-    else:
-        sky, ground_c, accent1, accent2, theme = "0.05 0.02 0.18, 0.24 0.05 0.36", "0.09 0.09 0.18", "0.05 1.00 0.75", "1.00 0.18 0.72", "grid_world"
 
-    safe_title = re.sub(r'["\r\n\x00]', " ", (prompt or world_name)).strip()[:80]
+def build_template_vrml_world(template_key: str, world_name: str, custom_desc: str = "") -> str:
+    """Builds a clean, deterministic VRML97 (.wrl) world from a named template."""
+    tkey = _clean_ident(template_key, 24, "flat").lower()
+    if tkey not in WORLD_TEMPLATES:
+        tkey = "flat"
+
+    tmeta = WORLD_TEMPLATES[tkey]
+    title_str = re.sub(r'["\r\n\x00]', " ", (custom_desc or tmeta["label"] or world_name)).strip()[:64]
+    desc_str = re.sub(r'["\r\n\x00]', " ", (custom_desc or tmeta["desc"])).strip()[:200]
+    seed = sum((idx + 1) * ord(ch) for idx, ch in enumerate(f"{world_name}:{tkey}")) or 42
+
+    themes = {
+        "flat": ("0.02 0.04 0.09, 0.05 0.12 0.20", "0.04 0.06 0.11", "0.00 0.95 0.85", "1.00 0.15 0.75"),
+        "cybercity": ("0.03 0.01 0.12, 0.18 0.04 0.30", "0.06 0.07 0.14", "0.00 1.00 0.85", "1.00 0.14 0.75"),
+        "forest": ("0.14 0.36 0.56, 0.35 0.62 0.78", "0.11 0.34 0.14", "0.18 0.72 0.25", "0.52 0.34 0.16"),
+        "desert": ("0.42 0.18 0.07, 0.75 0.38 0.14", "0.62 0.40 0.18", "0.92 0.64 0.24", "0.98 0.38 0.10"),
+        "crystal": ("0.06 0.18 0.38, 0.24 0.48 0.70", "0.68 0.82 0.92", "0.35 0.92 1.00", "0.70 0.50 1.00"),
+        "fortress": ("0.12 0.10 0.20, 0.28 0.20 0.34", "0.24 0.24 0.28", "0.85 0.68 0.22", "0.75 0.20 0.25"),
+        "island": ("0.05 0.28 0.52, 0.30 0.65 0.85", "0.04 0.32 0.58", "0.92 0.78 0.42", "0.15 0.85 0.75"),
+        "space": ("0.01 0.01 0.05, 0.09 0.02 0.20", "0.18 0.20 0.28", "0.10 0.95 0.80", "1.00 0.52 0.05"),
+    }
+    sky, ground_c, accent1, accent2 = themes[tkey]
+
     chunks = [
         "#VRML V2.0 utf8",
-        f'WorldInfo {{ title "{safe_title}" }}',
+        f'WorldInfo {{ title "{title_str}" info ["{desc_str}"] }}',
+        'NavigationInfo { type ["WALK" "ANY"] headlight TRUE }',
         f"Background {{ skyColor [{sky}] skyAngle [1.2] }}",
         f"Transform {{ translation 0 -0.05 0 children [ Shape {{ appearance Appearance {{ material Material {{ diffuseColor {ground_c} emissiveColor 0.02 0.02 0.04 }} }} geometry Box {{ size 120 0.1 120 }} }} ] }}",
     ]
 
-    if theme == "fortress":
-        corners = [(-14, -22), (14, -22), (-14, 4), (14, 4)]
-        for cx, cz in corners:
-            h = 7.5 + (seed % 4)
+    if tkey == "flat":
+        # Raised starter pad + 4 corner beacon markers so spawn orientation is immediately clear
+        chunks.append("Transform { translation 0 0.08 0 children [ Shape { appearance Appearance { material Material { diffuseColor 0.08 0.14 0.22 emissiveColor 0.02 0.20 0.26 } } geometry Box { size 10 0.16 10 } } ] }")
+        for bx, bz in ((-4.5, -4.5), (4.5, -4.5), (-4.5, 4.5), (4.5, 4.5)):
+            chunks.append(f"Transform {{ translation {bx} 0.65 {bz} children [ Shape {{ appearance Appearance {{ material Material {{ diffuseColor {accent1} emissiveColor {accent1} }} }} geometry Cylinder {{ radius 0.14 height 1.1 }} }} ] }}")
+    elif tkey == "fortress":
+        for cx, cz in ((-14, -22), (14, -22), (-14, 4), (14, 4)):
+            h = 8.5
             chunks.append(f"Transform {{ translation {cx} {h * 0.5:.2f} {cz} children [ Shape {{ appearance Appearance {{ material Material {{ diffuseColor 0.28 0.28 0.34 emissiveColor 0.04 0.04 0.06 }} }} geometry Cylinder {{ radius 2.1 height {h:.2f} }} }} ] }}")
             chunks.append(f"Transform {{ translation {cx} {h + 1.2:.2f} {cz} children [ Shape {{ appearance Appearance {{ material Material {{ diffuseColor {accent1} emissiveColor {accent1} }} }} geometry Cone {{ bottomRadius 2.5 height 2.5 }} }} ] }}")
+        chunks.append("Transform { translation 0 2.0 -22 children [ Shape { appearance Appearance { material Material { diffuseColor 0.24 0.24 0.30 emissiveColor 0.04 0.04 0.06 } } geometry Box { size 24 4.0 1.2 } } ] }")
+        chunks.append("Transform { translation -14 2.0 -9 children [ Shape { appearance Appearance { material Material { diffuseColor 0.24 0.24 0.30 emissiveColor 0.04 0.04 0.06 } } geometry Box { size 1.2 4.0 24 } } ] }")
+        chunks.append("Transform { translation 14 2.0 -9 children [ Shape { appearance Appearance { material Material { diffuseColor 0.24 0.24 0.30 emissiveColor 0.04 0.04 0.06 } } geometry Box { size 1.2 4.0 24 } } ] }")
         chunks.append(f"Transform {{ translation 0 1.4 -9 children [ Shape {{ appearance Appearance {{ material Material {{ diffuseColor {accent2} emissiveColor {accent2} }} }} geometry Sphere {{ radius 1.4 }} }} ] }}")
-        for idx in range(8):
-            ang = (2.0 * math.pi * idx) / 8.0
-            bx, bz = round(math.cos(ang) * 6.5, 2), round(-9.0 + math.sin(ang) * 6.5, 2)
-            chunks.append(f"Transform {{ translation {bx} 1.2 {bz} children [ Shape {{ appearance Appearance {{ material Material {{ diffuseColor {accent1} emissiveColor 0.15 0.12 0.04 }} }} geometry Box {{ size 1.4 2.4 1.4 }} }} ] }}")
-    elif theme == "island":
-        for idx in range(10):
-            ang = (2.0 * math.pi * idx) / 10.0
-            rad = 9.0 + ((idx * 5 + seed) % 11)
-            ix, iz = round(math.cos(ang) * rad, 2), round(math.sin(ang) * rad - 6.0, 2)
-            r_isl = round(2.6 + (idx % 3) * 1.1, 2)
+    elif tkey == "island":
+        chunks.append(f"Transform {{ translation 0 0.25 0 children [ Shape {{ appearance Appearance {{ material Material {{ diffuseColor {accent1} emissiveColor 0.06 0.05 0.02 }} }} geometry Cylinder {{ radius 7.5 height 0.5 }} }} ] }}")
+        for idx in range(9):
+            ang = (2.0 * math.pi * idx) / 9.0
+            rad = 12.0 + ((idx * 5 + seed) % 10)
+            ix, iz = round(math.cos(ang) * rad, 2), round(math.sin(ang) * rad - 4.0, 2)
+            r_isl = round(2.8 + (idx % 3) * 1.1, 2)
             chunks.append(f"Transform {{ translation {ix} 0.25 {iz} children [ Shape {{ appearance Appearance {{ material Material {{ diffuseColor {accent1} emissiveColor 0.06 0.05 0.02 }} }} geometry Cylinder {{ radius {r_isl} height 0.5 }} }} ] }}")
-            h_palm = round(3.0 + ((idx * 3 + seed) % 5), 2)
+            h_palm = round(3.2 + ((idx * 3 + seed) % 4), 2)
             chunks.append(f"Transform {{ translation {ix} {0.5 + h_palm * 0.5:.2f} {iz} children [ Shape {{ appearance Appearance {{ material Material {{ diffuseColor 0.45 0.28 0.12 emissiveColor 0.05 0.02 0.01 }} }} geometry Cylinder {{ radius 0.28 height {h_palm:.2f} }} }} ] }}")
             chunks.append(f"Transform {{ translation {ix} {0.5 + h_palm + 0.6:.2f} {iz} children [ Shape {{ appearance Appearance {{ material Material {{ diffuseColor {accent2} emissiveColor {accent2} }} }} geometry Cone {{ bottomRadius 1.8 height 1.5 }} }} ] }}")
     else:
         for idx in range(14):
             angle = (2.0 * math.pi * idx) / 14.0
-            radius = 10.0 + ((idx * 7 + seed) % 12)
+            radius = 11.0 + ((idx * 7 + seed) % 12)
             x = round(math.cos(angle) * radius, 2)
-            z = round(math.sin(angle) * radius - 6.0, 2)
-            h = round(3.0 + ((idx * 5 + seed) % 9), 2)
+            z = round(math.sin(angle) * radius - 4.0, 2)
+            h = round(3.2 + ((idx * 5 + seed) % 9), 2)
             col = accent1 if idx % 2 == 0 else accent2
-            if theme == "forest":
+            if tkey == "forest":
                 chunks.append(f"Transform {{ translation {x} {h * 0.35:.2f} {z} children [ Shape {{ appearance Appearance {{ material Material {{ diffuseColor 0.42 0.26 0.12 emissiveColor 0.08 0.04 0.02 }} }} geometry Cylinder {{ radius 0.45 height {h * 0.7:.2f} }} }} ] }}")
                 chunks.append(f"Transform {{ translation {x} {h * 0.85:.2f} {z} children [ Shape {{ appearance Appearance {{ material Material {{ diffuseColor {accent1} emissiveColor 0.03 0.14 0.05 }} }} geometry Cone {{ bottomRadius 2.4 height {h * 0.65:.2f} }} }} ] }}")
-            elif theme == "pyramid":
+            elif tkey == "desert":
                 chunks.append(f"Transform {{ translation {x} {h * 0.5:.2f} {z} children [ Shape {{ appearance Appearance {{ material Material {{ diffuseColor {col} emissiveColor 0.18 0.08 0.02 }} }} geometry Cone {{ bottomRadius {round(h * 1.35 * 0.65, 2)} height {h} }} }} ] }}")
-            elif theme == "crystal":
+            elif tkey == "crystal":
                 chunks.append(f"Transform {{ translation {x} {h * 0.5:.2f} {z} rotation 0.2 1.0 0.15 {round((idx * 0.45) % 3.14, 2)} children [ Shape {{ appearance Appearance {{ material Material {{ diffuseColor {col} emissiveColor 0.10 0.28 0.35 transparency 0.2 }} }} geometry Cone {{ bottomRadius 1.3 height {h} }} }} ] }}")
-            elif theme == "space":
+            elif tkey == "space":
                 chunks.append(f"Transform {{ translation {x} {round(2.5 + (idx % 4) * 1.6, 2)} {z} children [ Shape {{ appearance Appearance {{ material Material {{ diffuseColor {col} emissiveColor {col} }} }} geometry Sphere {{ radius {round(1.1 + (idx % 3) * 0.5, 2)} }} }} ] }}")
-            else:
-                w = round(2.2 + ((idx + seed) % 3) * 0.9, 2)
+            else:  # cybercity
+                w = round(2.4 + ((idx + seed) % 3) * 0.9, 2)
                 chunks.append(f"Transform {{ translation {x} {h * 0.5:.2f} {z} children [ Shape {{ appearance Appearance {{ material Material {{ diffuseColor 0.10 0.12 0.22 emissiveColor 0.03 0.04 0.08 }} }} geometry Box {{ size {w} {h} {w} }} }} ] }}")
                 chunks.append(f"Transform {{ translation {x} {h + 0.45:.2f} {z} children [ Shape {{ appearance Appearance {{ material Material {{ diffuseColor {col} emissiveColor {col} }} }} geometry Box {{ size {round(w * 1.06, 2)} 0.35 {round(w * 1.06, 2)} }} }} ] }}")
 
     return "\n".join(chunks) + "\n"
 
 
-def sanitize_ai_vrml(raw_wrl: str, prompt: str = "", world_name: str = "world") -> tuple[str, str]:
-    """Cleans LLM output and normalizes VRML97; returns (vrml_text, fallback_reason_or_empty)."""
-    wrl = re.sub(r"<think>.*?</think>", "", raw_wrl, flags=re.S).strip()
-    wrl = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", wrl)
-    wrl = re.sub(r"\s*```$", "", wrl).strip()
-
-    if "#VRML V2.0" in wrl:
-        wrl = wrl[wrl.index("#VRML V2.0") :]
-    elif "#VRML V1.0" in wrl:
-        wrl = wrl[wrl.index("#VRML V1.0") :]
-    else:
-        wrl = "#VRML V2.0 utf8\n" + wrl
-
-    wrl = re.sub(r"\b(?:DEF\s+[A-Za-z0-9_-]+\s+)?Script\s*\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", "", wrl, flags=re.S)
-    wrl = re.sub(r"\b(?:DEF\s+[A-Za-z0-9_-]+\s+)?Anchor\s*\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", "", wrl, flags=re.S)
-    wrl = wrl.replace(",", " ")
-    wrl = re.sub(r"\b(diffuseColor|emissiveColor|specularColor|skyColor|translation|rotation|scale|size|radius|height|bottomRadius)\s*:", r"\1 ", wrl)
-    wrl = re.sub(r"\bCube\b", "Box", wrl)
-    wrl = re.sub(r"\bBox\s*\{\s*([-+0-9.eE]+\s+[-+0-9.eE]+\s+[-+0-9.eE]+)\s*\}", r"Box { size \1 }", wrl)
-    wrl = re.sub(r"\bSphere\s*\{\s*([-+0-9.eE]+)\s*\}", r"Sphere { radius \1 }", wrl)
-    wrl = re.sub(r"\bCylinder\s*\{\s*([-+0-9.eE]+)\s+([-+0-9.eE]+)\s*\}", r"Cylinder { radius \1 height \2 }", wrl)
-    wrl = re.sub(r"\bCone\s*\{\s*([-+0-9.eE]+)\s+([-+0-9.eE]+)\s*\}", r"Cone { bottomRadius \1 height \2 }", wrl)
-
-    open_brackets = wrl.count("[") - wrl.count("]")
-    if open_brackets > 0:
-        wrl += "\n" + ("]\n" * open_brackets)
-    open_braces = wrl.count("{") - wrl.count("}")
-    if open_braces > 0:
-        wrl += "\n" + ("}\n" * open_braces)
-
-    parsed = parse_vrml(wrl)
-    non_floor = [o for o in parsed["objects"] if o.get("size", (0, 0, 0))[0] < 30]
-    if len(non_floor) < 4:
-        return _build_procedural_vrml_world(prompt, world_name), f"only {len(non_floor)} parsed 3D objects (<4)"
-    unique_xz = {(round(o["pos"][0], 1), round(o["pos"][2], 1)) for o in non_floor}
-    if len(unique_xz) <= 1:
-        return _build_procedural_vrml_world(prompt, world_name), "all objects at a single (X, Z) spot"
-    return wrl.strip() + "\n", ""
-
-
-def _resolve_ai_model(base_v1_url: str, api_key: str) -> str:
-    try:
-        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-        req = urllib.request.Request(f"{base_v1_url}/models", headers=headers, method="GET")
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            models = json.loads(resp.read().decode("utf-8", errors="replace")).get("data") or []
-            if models and isinstance(models[0], dict) and models[0].get("id"):
-                return models[0]["id"]
-    except Exception:
-        pass
-    return "default"
-
-
-def run_ai_world_gen(client: MetaverseClient, world_name: str, prompt: str):
-    clean_wname = _clean_ident(world_name, 32, "ai_world")
+def create_world_from_template(client: MetaverseClient, world_name: str, template_key: str = "flat", custom_desc: str = ""):
+    clean_wname = _clean_ident(world_name, 32, "")
+    if not clean_wname:
+        client.log("ERR", "#ff4444", "Specify a valid world name (letters, numbers, '_', '-').")
+        return
     if clean_wname.lower() == "hub":
-        client.log("ERR", "#ff4444", "Cannot overwrite core 'hub' world with /ai. Choose another world name.")
+        client.log("ERR", "#ff4444", "Cannot overwrite core 'hub' world. Choose another world name.")
+        return
+    tkey = _clean_ident(template_key, 24, "flat").lower()
+    if tkey not in WORLD_TEMPLATES:
+        avail = ", ".join(WORLD_TEMPLATES.keys())
+        client.log("ERR", "#ff4444", f"Unknown template '{template_key}'. Available: {avail}")
         return
 
-    def worker():
-        endpoint = client.ai_url.strip().rstrip("/")
-        if endpoint.endswith("/chat/completions"):
-            base_v1 = endpoint[: -len("/chat/completions")]
-        elif endpoint.endswith("/v1"):
-            base_v1, endpoint = endpoint, f"{endpoint}/chat/completions"
-        else:
-            base_v1 = f"{endpoint}/v1"
-            endpoint = f"{base_v1}/chat/completions"
+    tmeta = WORLD_TEMPLATES[tkey]
+    desc_out = (custom_desc.strip() or tmeta["desc"])[:200]
+    wrl = build_template_vrml_world(tkey, clean_wname, desc_out)
+    client.log("CREATE", "#00ff66", f"Creating '{clean_wname}' from template '{tkey}' ({tmeta['label']})...")
 
-        model_id = client.ai_model.strip() or _resolve_ai_model(base_v1, client.ai_api_key)
-        client.log("AI-AGENT", "#ff00aa", f"Generating '{clean_wname}' (model: {model_id})...")
+    if client.offline_mode or not client.connected:
+        store_cached_world(client.server_url, clean_wname, wrl, desc=desc_out)
+        client.load_offline_world(clean_wname)
+        return
 
-        sys_prompt = (
-            "You are a VRML97 (.wrl) 3D architect. Output ONLY raw VRML 2.0 code starting with "
-            "'#VRML V2.0 utf8'. No markdown fences, no prose, no Anchor, portal archway, or hub obelisk. "
-            "Design a custom world matching the prompt with 12 to 20 structures at varied X/Z coordinates, "
-            "plus a ground Box { size 120 0.1 120 } at y=-0.05. "
-            "Always include both diffuseColor and emissiveColor in Material. "
-            "Supported geometries: Box { size x y z }, Cylinder { radius r height h }, Cone { bottomRadius r height h }, Sphere { radius r }."
-        )
-        payload = json.dumps({
-            "model": model_id,
-            "messages": [
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": f"Build a custom 3D VRML97 world with 14+ distinct structures: {prompt}"},
-            ],
-            "temperature": 0.45,
-            "max_tokens": 4096,
-            "chat_template_kwargs": {"enable_thinking": False},
-        }).encode("utf-8")
-
-        headers = {"Content-Type": "application/json"}
-        if client.ai_api_key:
-            headers["Authorization"] = f"Bearer {client.ai_api_key}"
-
-        fallback_reason = ""
-        try:
-            with urllib.request.urlopen(urllib.request.Request(endpoint, data=payload, headers=headers, method="POST"), timeout=240) as resp:
-                msg_obj = json.loads(resp.read().decode("utf-8", errors="replace"))["choices"][0]["message"]
-                raw_text = msg_obj.get("content") or msg_obj.get("reasoning_content") or ""
-                wrl, fallback_reason = sanitize_ai_vrml(raw_text, prompt, clean_wname)
-                if fallback_reason:
-                    client.log("AI-FALLBACK", "#ffaa00", f"Used procedural synth ({fallback_reason}); check /aiurl and /aimodel.")
-        except Exception as e:
-            client.log("AI-WARN", "#ffaa00", f"LLM unavailable ({e}); synthesizing themed 3D scene...")
-            wrl = _build_procedural_vrml_world(prompt, clean_wname)
-
-        _write_secure_file(LAST_AI_WRL, wrl, mode=0o600)
-        client.log("AI-AGENT", "#00ff66", f"Ready: {len(wrl)}B ({len(parse_vrml(wrl)['objects'])} objs) -> saved {LAST_AI_WRL.name}")
-        if client.offline_mode or not client.connected:
-            store_cached_world(client.server_url, clean_wname, wrl, desc=prompt[:200])
-            client.load_offline_world(clean_wname)
-            return
-        client.send_json({"type": "upload", "kind": "world", "name": clean_wname, "filename": f"{clean_wname}.wrl", "description": prompt[:200], "content": wrl})
-
-    threading.Thread(target=worker, daemon=True).start()
+    client.send_json({
+        "type": "upload",
+        "kind": "world",
+        "name": clean_wname,
+        "filename": f"{clean_wname}.wrl",
+        "description": desc_out,
+        "content": wrl,
+    })
 
 
 def _extract_placed_id_and_nums(sub_tokens: list[str], looked_at_hit, expected_num_count: int | None = None):
@@ -2311,7 +2254,7 @@ def handle_command(client: MetaverseClient, text: str):
         client.log("COMMANDS", "#ff66cc", "Jump: /worlds | /world <name> | /tp [x y z] | /spawn | /peers | /hop <node> [world] | /back")
         client.log("COMMANDS", "#ff66cc", "Build: /place <shape> [color] [scale] | /moveobj <dx dy dz> | /rotateobj <deg> | /paint <color>")
         client.log("COMMANDS", "#ff66cc", "Edit: /scaleobj <mult> | /cloneobj [dx dy dz] | /delobj [id] | /undo | /setspawn | /clearspawn")
-        client.log("COMMANDS", "#ff66cc", "Tools: /inspect | [I]=Scan | /crt | /fly | /radio | /mute | /info | /upload | /ai <world> <prompt>")
+        client.log("COMMANDS", "#ff66cc", "Worlds: /templates | /createworld <name> [template] [desc] | /upload | /info | /inspect | [I]=Scan")
     elif cmd in ("/quit", "/exit"):
         client.running = False
     elif cmd == "/crt":
@@ -2684,10 +2627,11 @@ def handle_command(client: MetaverseClient, text: str):
                     client.unstuck_req = True
             elif action == "quit":
                 client.running = False
-            elif action == "ai":
-                wname, _, wprompt = rendered.partition(" ")
-                if wname and wprompt:
-                    run_ai_world_gen(client, wname, wprompt)
+            elif action in ("createworld", "template"):
+                wname, _, wrest = rendered.partition(" ")
+                wtpl, _, wdesc = wrest.partition(" ")
+                if wname:
+                    create_world_from_template(client, wname, wtpl or "flat", wdesc)
 
         if spec.get("action", "chat").lower() == "multi":
             for step_line in spec.get("steps", []):
@@ -2817,26 +2761,20 @@ def handle_command(client: MetaverseClient, text: str):
         if len(sub) >= 5:
             payload["description"] = sub[4]
         client.send_json(payload)
-    elif cmd == "/aiurl":
-        if len(parts) == 1:
-            client.log("AI-URL", "#00ffcc", f"Current AI endpoint: {client.ai_url}")
+    elif cmd == "/templates":
+        client.log("TEMPLATES", "#00ff66", "Available World Templates (use /createworld <name> <template> [description]):")
+        for tkey, tmeta in WORLD_TEMPLATES.items():
+            client.log("TEMPLATE", "#00ffcc", f"  {tkey:<10} - {tmeta['label']}: {tmeta['desc']}")
+    elif cmd == "/createworld":
+        sub = cleaned.split(" ", 3)
+        if len(sub) < 2 or not sub[1].strip():
+            avail = ", ".join(WORLD_TEMPLATES.keys())
+            client.log("ERR", "#ff4444", f"Usage: /createworld <world_name> [template] [description] (templates: {avail})")
             return
-        ok_ai, err_ai = is_safe_ai_endpoint(parts[1])
-        if not ok_ai:
-            client.log("ERR", "#ff4444", err_ai)
-            return
-        client.ai_url = parts[1]
-        if len(parts) >= 3:
-            client.ai_api_key = parts[2]
-        client.log("AI-URL", "#00ff66", f"AI endpoint set to: {client.ai_url}")
-    elif cmd == "/aimodel":
-        client.ai_model = "" if (len(parts) > 1 and parts[1].lower() == "auto") else (parts[1] if len(parts) > 1 else client.ai_model)
-        client.log("AI-MODEL", "#00ffcc" if len(parts) == 1 else "#00ff66", f"Current AI model: {client.ai_model or '(auto-detect from /v1/models)'}" if len(parts) == 1 else f"AI model set to: {client.ai_model or 'auto'}")
-    elif cmd == "/ai":
-        if len(parts) < 3:
-            client.log("ERR", "#ff4444", "Usage: /ai <world_name> <description of world>")
-            return
-        run_ai_world_gen(client, parts[1], parts[2])
+        w_name = sub[1].strip()
+        t_key = sub[2].strip() if len(sub) >= 3 and sub[2].strip() else "flat"
+        w_desc = sub[3].strip() if len(sub) >= 4 else ""
+        create_world_from_template(client, w_name, t_key, w_desc)
     else:
         client.send_json({"type": "chat", "text": text})
 
